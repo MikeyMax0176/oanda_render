@@ -1,4 +1,4 @@
-# src/dashboard.py
+cat > dashboard.py <<'PY'
 import os, requests, streamlit as st, pandas as pd
 from datetime import datetime, timedelta, timezone
 
@@ -125,3 +125,4 @@ for t in sorted(trades, key=lambda x: x["openTime"]):
             r2 = put(f"/accounts/{ACC}/trades/{t['id']}", {"stopLoss":{"price":f"{sl:.5f}"}})
             st.write("TP:", r1.status_code, r1.text[:200])
             st.write("SL:", r2.status_code, r2.text[:200])
+PY
