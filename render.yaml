@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: oanda-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run dashboard.py --server.address 0.0.0.0 --server.port $PORT
+    envVars:
+      - key: OANDA_HOST
+        value: https://api-fxpractice.oanda.com
+      - key: OANDA_TOKEN
+        sync: false
+      - key: OANDA_ACCOUNT
+        sync: false
+
+  - type: worker
+    name: oanda-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: OANDA_HOST
+        value: https://api-fxpractice.oanda.com
+      - key: OANDA_TOKEN
+        sync: false
+      - key: OANDA_ACCOUNT
+        sync: false
