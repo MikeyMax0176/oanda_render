@@ -1,23 +1,51 @@
 # dashboard.py
 import os
+import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
 import requests
 import streamlit as st
 
-# ---- ENV / API ----
-HOST = os.environ["OANDA_HOST"]
+# =========================
+# Config / Environment
+# =========================
+HOST  = os.environ["OANDA_HOST"]
 TOKEN = os.environ["OANDA_TOKEN"]
-ACC = os.environ["OANDA_ACCOUNT"]
-API = f"{HOST}/v3"
-H = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+ACC   = os.environ["OANDA_ACCOUNT"]
+API   = f"{HOST}/v3"
+H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-# Instrument pip/tick precision
-PIP_MAP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}
-DIGITS = {"EUR_USD": 5, "GBP_USD": 5, "USD_JPY": 3, "XAU_USD": 2}  # for price formatting
+# Optional file paths (bot/news workers can write these)
+ROOT_DIR            = Path(os.environ.get("APP_ROOT", "/opt/render/project/src"))
+RUNTIME_DIR         = ROOT_DIR / "runtime"
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
+HEARTBEAT_PATH      = Path(os.environ.get("NS_HEARTBEAT_PATH", str(RUNTIME_DIR / "bot_heartbeat.json")))
+LAST_TRADE_PATH     = Path(os.environ.get("NS_LAST_TRADE_PATH", str(RUNTIME_DIR / "last_trade.json")))
+NEWS_SIGNAL_PATH    = Path(os.environ.get("NS_NEWS_PATH",       str(RUNTIME_DIR / "news_signal.json")))
+
+# Risk/behavior knobs (for display only)
+RISK_PCT           = float(os.getenv("NS_RISK_PCT", "0.005"))
+SL_PIPS            = float(os.getenv("NS_SL_PIPS", "25"))
+TP_PIPS            = float(os.getenv("NS_TP_PIPS", "38"))
+SENT_THRESH        = float(os.getenv("NS_SENT_THRESH", "0.15"))
+COOLDOWN_MIN       = float(os.getenv("NS_COOLDOWN_MIN", "0"))
+TRADE_INTERVAL_MIN = float(os.getenv("NS_TRADE_INTERVAL_MIN", "1"))
+MAX_CONCURRENT     = int(os.getenv("NS_MAX_CONCURRENT", "3"))
+MIN_SPREAD         = float(os.getenv("NS_MIN_SPREAD", "0.0002"))
+MAX_DAILY_LOSS     = float(os.getenv("NS_MAX_DAILY_LOSS", "1500"))
+INSTRUMENTS        = [x.strip() for x in os.getenv("NS_INSTRUMENTS", "EUR_USD,GBP_USD,USD_JPY").split(",") if x.strip()]
+
+PIP_MAP = {"EUR_USD":0.0001, "GBP_USD":0.0001, "USD_JPY":0.01, "XAU_USD":0.1}
+DIGITS  = {"EUR_USD":5, "GBP_USD":5, "USD_JPY":3, "XAU_USD":2}
+
+# =========================
+# Helpers
+# =========================
 def fmt_price(inst: str, x: float) -> str:
-    return f"{x:.{DIGITS.get(inst, 5)}f}"
+    return f"{x:.{DIGITS.get(inst,5)}f}"
 
 def get(path: str, params: dict | None = None):
     r = requests.get(f"{API}{path}", headers=H, params=params, timeout=20)
@@ -25,55 +53,220 @@ def get(path: str, params: dict | None = None):
     return r.json()
 
 def post(path: str, body: dict):
-    r = requests.post(f"{API}{path}", headers=H, json=body, timeout=20)
-    return r
+    return requests.post(f"{API}{path}", headers=H, json=body, timeout=20)
 
 def put(path: str, body: dict):
-    r = requests.put(f"{API}{path}", headers=H, json=body, timeout=20)
-    return r
+    return requests.put(f"{API}{path}", headers=H, json=body, timeout=20)
 
-# ---- UI SETUP ----
+def read_json_safe(p: Path):
+    try:
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return None
+
+def file_age_seconds(p: Path) -> float | None:
+    try:
+        if p.exists():
+            return max(0.0, time.time() - p.stat().st_mtime)
+    except Exception:
+        return None
+    return None
+
+def account_summary():
+    return get(f"/accounts/{ACC}/summary")["account"]
+
+def open_trades():
+    return get(f"/accounts/{ACC}/trades").get("trades", [])
+
+def recent_transactions(days: int = 14):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    try:
+        j = get(f"/accounts/{ACC}/transactions",
+                params={
+                    "from": start.isoformat(),
+                    "to": end.isoformat(),
+                    "type": "ORDER_FILL,ORDER_CANCEL,TRADE_CLOSE"
+                })
+        return j.get("transactions", [])
+    except requests.HTTPError:
+        return []
+
+def today_realized_pl():
+    """Sum realized PL (fills & closes) since UTC midnight."""
+    now = datetime.now(timezone.utc)
+    start = datetime(year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc)
+    try:
+        j = get(f"/accounts/{ACC}/transactions",
+                params={
+                    "from": start.isoformat(),
+                    "to": now.isoformat(),
+                    "type": "ORDER_FILL,TRADE_CLOSE"
+                })
+        pl = 0.0
+        for t in j.get("transactions", []):
+            if "pl" in t:
+                try:
+                    pl += float(t["pl"])
+                except Exception:
+                    pass
+        return pl
+    except requests.HTTPError:
+        return None
+
+# =========================
+# UI
+# =========================
 st.set_page_config(page_title="OANDA Monitor", layout="wide")
 st.title("OANDA Monitor")
 
-# ---- HEADER / ACCOUNT SUMMARY ----
-err_box = st.empty()
+# Auto-refresh every 10s
+st_autorefresh = st.empty()
+st_autorefresh.write(f"Auto-refresh every 10s · {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+st.experimental_set_query_params(_=str(int(time.time())))  # make sure Streamlit doesn't cache too hard
+st.experimental_rerun if False else None  # no-op; placeholder to appease linters
+
+# =========================
+# Status Light + Account header
+# =========================
+acc = None
+api_ok = False
+api_err = None
 try:
-    acc = get(f"/accounts/{ACC}/summary")["account"]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Account", acc.get("alias", ACC))
-    c2.metric("Balance", acc["balance"])
-    c3.metric("Unrealized P/L", acc.get("unrealizedPL", "0"))
-    c4.metric("NAV", acc.get("NAV", acc["balance"]))
+    acc = account_summary()
+    api_ok = True
 except Exception as e:
-    err_box.error(f"Failed to fetch account summary: {e}")
+    api_err = str(e)
+
+hb_age = file_age_seconds(HEARTBEAT_PATH)
+hb_fresh = (hb_age is not None) and (hb_age <= 120)
+
+working = api_ok and hb_fresh
+
+def status_dot(green: bool):
+    color = "#29cc6a" if green else "#ff4d4f"
+    return f"""
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="width:14px;height:14px;border-radius:50%;background:{color};box-shadow:0 0 8px {color};"></div>
+      <span style="font-weight:600;color:{color}">{'Working' if green else 'Not working'}</span>
+    </div>
+    """
+
+c0, c1, c2, c3, c4 = st.columns([1.2, 2, 2, 2, 2])
+with c0:
+    st.markdown(status_dot(working), unsafe_allow_html=True)
+with c1:
+    st.metric("Account", acc.get("alias", ACC) if acc else ACC)
+with c2:
+    st.metric("Balance", acc["balance"] if acc else "—")
+with c3:
+    st.metric("Unrealized P/L", acc.get("unrealizedPL", "0") if acc else "—")
+with c4:
+    st.metric("NAV", acc.get("NAV", acc["balance"]) if acc else "—")
+
+if not api_ok:
+    st.error(f"OANDA API error: {api_err}")
+if hb_age is None:
+    st.info("No heartbeat file found yet (expected at: {})".format(HEARTBEAT_PATH))
+elif not hb_fresh:
+    st.warning(f"Heartbeat stale: last update {int(hb_age)}s ago (threshold 120s).")
 
 st.divider()
 
-# ---- PLACE TRADE FORM ----
+# =========================
+# Bot Status panel
+# =========================
+st.subheader("Bot Status")
+
+bs1, bs2, bs3, bs4 = st.columns(4)
+bs1.metric("Max Concurrent Trades", f"{MAX_CONCURRENT}")
+bs2.metric("Trade Interval (min)", f"{TRADE_INTERVAL_MIN}")
+bs3.metric("Cooldown (min)", f"{COOLDOWN_MIN}")
+bs4.metric("Min Spread", f"{MIN_SPREAD}")
+
+cs1, cs2, cs3, cs4 = st.columns(4)
+cs1.metric("Risk % per Trade", f"{RISK_PCT*100:.2f}%")
+cs2.metric("SL (pips)", f"{SL_PIPS}")
+cs3.metric("TP (pips)", f"{TP_PIPS}")
+cs4.metric("Sentiment Threshold", f"{SENT_THRESH:+.2f}")
+
+# live counts
+open_ts = []
+try:
+    open_ts = open_trades()
+except Exception as e:
+    st.warning(f"Unable to fetch open trades: {e}")
+
+daily_pl = today_realized_pl()
+ds1, ds2, ds3 = st.columns(3)
+ds1.metric("Open Trades", f"{len(open_ts)}")
+ds2.metric("Realized P/L (UTC today)", "—" if daily_pl is None else f"{daily_pl:.2f}")
+ds3.metric("Max Daily Loss (guard)", f"-{MAX_DAILY_LOSS:.0f}")
+
+# =========================
+# Headline traded on (and latest signal)
+# =========================
+st.subheader("Latest Trade Headline")
+
+lt = read_json_safe(LAST_TRADE_PATH) or {}
+sig = read_json_safe(NEWS_SIGNAL_PATH) or {}
+
+if lt:
+    ln1 = lt.get("headline") or lt.get("title") or "—"
+    url = lt.get("url") or lt.get("link")
+    inst = lt.get("instrument", "—")
+    side = lt.get("side", "—")
+    sent = lt.get("sentiment", None)
+    ts   = lt.get("time") or lt.get("timestamp")
+    st.write(f"**Instrument:** {inst} · **Side:** {side} · **Sentiment:** {sent if sent is not None else '—'} · **Time:** {ts if ts else '—'}")
+    if url:
+        st.markdown(f"[{ln1}]({url})")
+    else:
+        st.write(ln1)
+else:
+    st.info("No recorded trade headline yet.")
+    # Fall back to current signal so user sees *something*
+    if sig:
+        st.caption("Most recent news signal:")
+        ln1 = sig.get("headline") or sig.get("title") or "—"
+        url = sig.get("url") or sig.get("link")
+        sent = sig.get("sentiment", "—")
+        st.write(f"**Sentiment:** {sent}")
+        if url:
+            st.markdown(f"[{ln1}]({url})")
+        else:
+            st.write(ln1)
+
+st.divider()
+
+# =========================
+# Place Market Order (manual)
+# =========================
 st.subheader("Place Market Order (with TP/SL)")
+
 with st.form("place_trade"):
-    c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.8, 1.2, 1.2])
-    instrument = c1.selectbox("Instrument", ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"], index=0)
-    side = c2.selectbox("Side", ["BUY", "SELL"], index=0)
-    units_abs = c3.number_input("Units (absolute)", min_value=1, step=100, value=5000)
-    tp_pips = c4.number_input("TP (pips)", min_value=1, value=50)
-    sl_pips = c5.number_input("SL (pips)", min_value=1, value=25)
-    submitted = st.form_submit_button("Submit Order")
+    c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.6, 1.2, 1.2])
+    instrument = c1.selectbox("Instrument", INSTRUMENTS, index=0)
+    side       = c2.selectbox("Side", ["BUY", "SELL"], index=0)
+    units_abs  = c3.number_input("Units (absolute)", min_value=1, step=100, value=5000)
+    tp_pips_in = c4.number_input("TP (pips)", min_value=1, value=int(TP_PIPS))
+    sl_pips_in = c5.number_input("SL (pips)", min_value=1, value=int(SL_PIPS))
+    submitted  = st.form_submit_button("Submit Order")
 
 if submitted:
     try:
-        # Pricing is account-scoped
-        q = get(f"/accounts/{ACC}/pricing", params={"instruments": instrument})
-        px = q["prices"][0]
-        bid = float(px["bids"][0]["price"])
-        ask = float(px["asks"][0]["price"])
+        pip = PIP_MAP.get(instrument, 0.0001)
+        # OANDA pricing endpoint needs ?instruments= and optionally account
+        pr = get("/pricing", params={"instruments": instrument, "accountId": ACC})
+        bid = float(pr["prices"][0]["bids"][0]["price"])
+        ask = float(pr["prices"][0]["asks"][0]["price"])
         is_buy = (side == "BUY")
         entry = ask if is_buy else bid
 
-        pip = PIP_MAP.get(instrument, 0.0001)
-        tp = entry + (tp_pips * pip if is_buy else -tp_pips * pip)
-        sl = entry - (sl_pips * pip if is_buy else -sl_pips * pip)
+        tp = entry + (tp_pips_in * pip if is_buy else -tp_pips_in * pip)
+        sl = entry - (sl_pips_in * pip if is_buy else -sl_pips_in * pip)
 
         units = units_abs if is_buy else -units_abs
         body = {
@@ -83,103 +276,55 @@ if submitted:
                 "units": str(units),
                 "timeInForce": "FOK",
                 "positionFill": "DEFAULT",
-                "takeProfitOnFill": {"price": fmt_price(instrument, tp)},
-                "stopLossOnFill": {"price": fmt_price(instrument, sl)},
+                "takeProfitOnFill": {"price": f"{tp:.5f}", "timeInForce": "GTC"},
+                "stopLossOnFill":  {"price": f"{sl:.5f}", "timeInForce": "GTC"}
             }
         }
         r = post(f"/accounts/{ACC}/orders", body)
         if r.status_code in (200, 201):
-            st.success(f"Order accepted ({r.status_code}).")
+            st.success(f"Order placed ({r.status_code})")
         else:
-            st.error(f"Order failed: {r.status_code}\n{r.text[:800]}")
-        with st.expander("Order response"):
-            st.code(r.text, language="json")
+            st.error(f"Order failed ({r.status_code}): {r.text[:400]}")
+        st.code(r.text, language="json")
     except Exception as e:
-        st.error(f"Order error: {e}")
+        st.error(f"Order failed: {e}")
 
 st.divider()
 
-# ---- OPEN TRADES & PER-TRADE TP/SL ----
-st.subheader("Open Trades (adjust TP/SL)")
-
-def load_trades():
-    try:
-        j = get(f"/accounts/{ACC}/trades")
-        return sorted(j.get("trades", []), key=lambda t: t["openTime"])
-    except Exception as e:
-        st.error(f"Failed to fetch trades: {e}")
-        return []
-
-trades = load_trades()
-if not trades:
-    st.info("No open trades.")
-else:
-    for t in trades:
+# =========================
+# Open Trades
+# =========================
+st.subheader("Open Trades")
+try:
+    trades = open_ts if open_ts else open_trades()
+    for t in sorted(trades, key=lambda x: x["openTime"]):
         inst = t["instrument"]
         units = t["currentUnits"]
         entry = float(t["price"])
         is_long = not str(units).startswith("-")
-        pip = PIP_MAP.get(inst, 0.0001)
+        with st.expander(f"{inst} #{t['id']} units={units} @ {fmt_price(inst, entry)}"):
+            colA, colB = st.columns(2)
+            tp_pips_set = colA.number_input("TP (pips)", value=int(TP_PIPS), key=f"tp_{t['id']}")
+            sl_pips_set = colB.number_input("SL (pips)", value=int(SL_PIPS), key=f"sl_{t['id']}")
+            pip = PIP_MAP.get(inst, 0.0001)
+            tp = entry + (tp_pips_set * pip if is_long else -tp_pips_set * pip)
+            sl = entry - (sl_pips_set * pip if is_long else -sl_pips_set * pip)
+            st.write(f"Proposed TP={fmt_price(inst, tp)}  SL={fmt_price(inst, sl)}")
+            if st.button("Apply TP/SL", key=f"set_{t['id']}"):
+                r1 = put(f"/accounts/{ACC}/trades/{t['id']}", {"takeProfit": {"price": f"{tp:.5f}"}})
+                r2 = put(f"/accounts/{ACC}/trades/{t['id']}", {"stopLoss":  {"price": f"{sl:.5f}"}})
+                st.write("TP:", r1.status_code, r1.text[:200])
+                st.write("SL:", r2.status_code, r2.text[:200])
+except Exception as e:
+    st.warning(f"Could not list open trades: {e}")
 
-        with st.expander(f"{inst} #{t['id']}  units={units}  @ {fmt_price(inst, entry)}  (opened {t['openTime']})"):
-            # Try to show current dependent orders
-            try:
-                d = get(f"/accounts/{ACC}/trades/{t['id']}")
-                detail = d.get("trade", {})
-                cur_tp = (detail.get("takeProfitOrder") or {}).get("price")
-                cur_sl = (detail.get("stopLossOrder") or {}).get("price")
-                st.write(f"Current TP: {cur_tp} | Current SL: {cur_sl}")
-            except Exception:
-                st.write("Current TP/SL: (unavailable)")
-
-            colA, colB, colC = st.columns([1, 1, 1])
-            tp_in = colA.number_input("TP pips", value=50, key=f"tp_{t['id']}")
-            sl_in = colB.number_input("SL pips", value=25, key=f"sl_{t['id']}")
-            tp_new = entry + (tp_in * pip if is_long else -tp_in * pip)
-            sl_new = entry - (sl_in * pip if is_long else -sl_in * pip)
-            colC.write(f"Proposed TP={fmt_price(inst, tp_new)}  SL={fmt_price(inst, sl_new)}")
-
-            if st.button("Set TP/SL", key=f"set_{t['id']}"):
-                try:
-                    body = {
-                        "takeProfit": {"price": fmt_price(inst, tp_new)},
-                        "stopLoss": {"price": fmt_price(inst, sl_new)},
-                    }
-                    r = put(f"/accounts/{ACC}/trades/{t['id']}/orders", body)
-                    if r.status_code == 200:
-                        st.success("TP/SL set.")
-                    else:
-                        st.error(f"Set failed: {r.status_code}\n{r.text[:800]}")
-                    with st.expander("Response"):
-                        st.code(r.text, language="json")
-                except Exception as e:
-                    st.error(f"Error setting TP/SL: {e}")
-
-st.divider()
-
-# ---- ACTIVITY (last N transactions) ----
-st.subheader("Recent Activity")
-with st.spinner("Loading recent transactions…"):
-    try:
-        # Pull a small window using lastTransactionID as a safer cursor
-        acc_now = get(f"/accounts/{ACC}/summary")["account"]
-        last_id = int(acc_now.get("lastTransactionID", "0"))
-        # Fetch the last ~50 transactions by ID range (avoid time parsing issues)
-        lo = max(0, last_id - 200)
-        j = get(f"/accounts/{ACC}/transactions/idrange",
-                params={"from": str(lo), "to": str(last_id)})
-        txs = j.get("transactions", [])
-        if not txs:
-            st.info("No recent transactions found.")
-        else:
-            for tx in txs[-50:]:
-                with st.expander(f"{tx['time']}  {tx['type']}  (id {tx['id']})"):
-                    st.code(tx, language="json")
-    except Exception as e:
-        st.warning(f"Could not load transactions (showing none). Details: {e}")
-
-# ---- FOOTER ----
-st.caption(
-    f"UTC now: {datetime.now(timezone.utc).isoformat()} • "
-    f"Service Host: {os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'local')}"
-)
+# =========================
+# Recent Transactions
+# =========================
+st.subheader("Recent Transactions (last 14 days)")
+tx = recent_transactions(14)
+if not tx:
+    st.caption("No transactions to show (or endpoint not available).")
+else:
+    for t in tx[-50:][::-1]:  # show up to the latest 50, newest first
+        st.code(json.dumps(t, indent=2), language="json")
