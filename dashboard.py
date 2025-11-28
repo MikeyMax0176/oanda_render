@@ -21,6 +21,50 @@ c1,c2,c3=st.columns(3)
 c1.metric("Balance", acc["balance"])
 c2.metric("Unrealized P/L", acc.get("unrealizedPL","0"))
 c3.metric("NAV", acc.get("NAV", acc["balance"]))
+st.subheader("Place Trade")
+
+with st.form("place_trade"):
+    c1,c2,c3,c4 = st.columns([2,2,2,2])
+    instrument = c1.selectbox("Instrument", ["EUR_USD","GBP_USD","USD_JPY","XAU_USD"], index=0)
+    side       = c2.selectbox("Side", ["BUY","SELL"], index=0)
+    units_abs  = c3.number_input("Units (abs)", min_value=1, step=100, value=5000)
+    riskcol1, riskcol2 = st.columns(2)
+    tp_pips = riskcol1.number_input("TP pips", min_value=1, value=50)
+    sl_pips = riskcol2.number_input("SL pips", min_value=1, value=25)
+    submitted = st.form_submit_button("Submit Order")
+
+if submitted:
+    try:
+        pip_map={"EUR_USD":0.0001,"GBP_USD":0.0001,"USD_JPY":0.01,"XAU_USD":0.1}
+        pip = pip_map.get(instrument,0.0001)
+
+        # fetch quote for TP/SL calc
+        pr = requests.get(f"{API}/pricing?instruments={instrument}", headers=H, timeout=15).json()
+        bid = float(pr["prices"][0]["bids"][0]["price"])
+        ask = float(pr["prices"][0]["asks"][0]["price"])
+        is_buy = (side=="BUY")
+        entry = ask if is_buy else bid
+
+        tp = entry + (tp_pips*pip if is_buy else -tp_pips*pip)
+        sl = entry - (sl_pips*pip if is_buy else -sl_pips*pip)
+
+        units = units_abs if is_buy else -units_abs
+        body = {
+          "order": {
+            "type":"MARKET",
+            "instrument": instrument,
+            "units": str(units),
+            "timeInForce":"FOK",
+            "positionFill":"DEFAULT",
+            "takeProfitOnFill":{"price": f"{tp:.5f}"},
+            "stopLossOnFill": {"price": f"{sl:.5f}"}
+          }
+        }
+        r = requests.post(f"{API}/accounts/{ACC}/orders", headers=H, json=body, timeout=20)
+        st.success(f"Order status {r.status_code}")
+        st.code(r.text, language="json")
+    except Exception as e:
+        st.error(f"Failed: {e}")
 
 st.subheader("Open Trades")
 trades=get(f"/accounts/{ACC}/trades")["trades"]
