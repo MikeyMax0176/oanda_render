@@ -1,205 +1,186 @@
-# bot.py  (full replacement or merge carefully if you have custom logic)
-import os, time, math, requests
-from datetime import datetime, timezone, timedelta
+# bot.py  — minimal test worker for Render dashboard wiring
+# - Heartbeat every 10s -> runtime/bot_heartbeat.json
+# - Fake last-trade snapshot every 30s -> runtime/last_trade.json
+# - Optional REAL trade if ENABLE_TRADING=1
 
-HOST = os.environ["OANDA_HOST"]
+import os, json, time, math
+from datetime import datetime, timezone
+from pathlib import Path
+import requests
+
+# ---------- CONFIG / ENV ----------
+HOST  = os.environ["OANDA_HOST"]
 TOKEN = os.environ["OANDA_TOKEN"]
-ACC = os.environ["OANDA_ACCOUNT"]
-API  = f"{HOST}/v3"
-H    = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+ACC   = os.environ["OANDA_ACCOUNT"]
+API   = f"{HOST}/v3"
+H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-# === Tunables from ENV ===
-RISK_PCT        = float(os.getenv("NS_RISK_PCT", "0.005"))        # 0.5% ≈ $500 on 100k
-SL_PIPS          = float(os.getenv("NS_SL_PIPS", "25"))
-TP_PIPS          = float(os.getenv("NS_TP_PIPS", "38"))
-SENT_THRESH      = float(os.getenv("NS_SENT_THRESH", "0.15"))
-COOLDOWN_MIN     = float(os.getenv("NS_COOLDOWN_MIN", "0"))
-TRADE_INTERVAL   = float(os.getenv("NS_TRADE_INTERVAL_MIN", "1"))  # global throttle minutes
-POLL_SEC         = int(os.getenv("NS_POLL_SEC", "20"))
-MAX_CONCURRENT   = int(os.getenv("NS_MAX_CONCURRENT", "3"))
-MIN_SPREAD       = float(os.getenv("NS_MIN_SPREAD", "0.0002"))
-MAX_DAILY_LOSS   = float(os.getenv("NS_MAX_DAILY_LOSS", "1500"))
-INSTRUMENTS      = [x.strip() for x in os.getenv("NS_INSTRUMENTS", "EUR_USD").split(",") if x.strip()]
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "0") == "1"   # set in Render env to actually trade
+INSTRUMENT     = os.getenv("BOT_INSTRUMENT", "EUR_USD")
+UNITS_DEFAULT  = int(os.getenv("BOT_UNITS", "1000"))
+TP_PIPS        = int(os.getenv("BOT_TP_PIPS", "50"))
+SL_PIPS        = int(os.getenv("BOT_SL_PIPS", "25"))
 
-PIP = {"EUR_USD":0.0001, "GBP_USD":0.0001, "USD_JPY":0.01, "XAU_USD":0.1}
+PIP_MAP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}
+DIGITS  = {"EUR_USD": 5, "GBP_USD": 5, "USD_JPY": 3, "XAU_USD": 2}
 
-last_trade_time  = None
-daily_start_date = None
-daily_pl         = 0.0
+# ---------- RUNTIME FILES ----------
+ROOT_DIR    = Path(os.environ.get("APP_ROOT", "/opt/render/project/src"))
+RUNTIME_DIR = ROOT_DIR / "runtime"
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
-def get(p, params=None):
-    r = requests.get(f"{API}{p}", headers=H, params=params, timeout=20)
+HEARTBEAT_PATH  = Path(os.environ.get("NS_HEARTBEAT_PATH", str(RUNTIME_DIR / "bot_heartbeat.json")))
+LAST_TRADE_PATH = Path(os.environ.get("NS_LAST_TRADE_PATH",  str(RUNTIME_DIR / "last_trade.json")))
+NEWS_PATH       = Path(os.environ.get("NS_NEWS_PATH",        str(RUNTIME_DIR / "news_signal.json")))
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def fmt_price(inst: str, x: float) -> str:
+    return f"{x:.{DIGITS.get(inst, 5)}f}"
+
+def get(path: str, params: dict | None = None):
+    r = requests.get(f"{API}{path}", headers=H, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def post(p, body):
-    return requests.post(f"{API}{p}", headers=H, json=body, timeout=20)
+def post(path: str, body: dict):
+    return requests.post(f"{API}{path}", headers=H, json=body, timeout=20)
 
-def now_utc():
-    return datetime.now(timezone.utc)
+def fetch_quote(inst: str):
+    j = get(f"/pricing", params={"instruments": inst})
+    bid = float(j["prices"][0]["bids"][0]["price"])
+    ask = float(j["prices"][0]["asks"][0]["price"])
+    return bid, ask
 
-def reset_daily_if_needed():
-    global daily_start_date, daily_pl
-    today = now_utc().date()
-    if daily_start_date != today:
-        daily_start_date = today
-        daily_pl = 0.0
+def write_heartbeat():
+    HEARTBEAT_PATH.write_text(json.dumps({"ts": now_utc()}))
 
-def account_summary():
-    return get(f"/accounts/{ACC}/summary")["account"]
+def write_last_trade_snapshot(data: dict):
+    LAST_TRADE_PATH.write_text(json.dumps(data))
 
-def open_trades():
-    return get(f"/accounts/{ACC}/trades").get("trades", [])
-
-def recent_pl_increment(minutes=2):
-    """Approx PL delta from most recent fills in the last N minutes."""
-    end = now_utc()
-    start = end - timedelta(minutes=minutes)
-    j = get(f"/accounts/{ACC}/transactions",
-            params={"from": start.isoformat(), "to": end.isoformat(),
-                    "type":"ORDER_FILL,TRADE_CLOSE"})
-    inc = 0.0
-    for t in j.get("transactions", []):
-        # realized PL on close; ignore tiny floats
-        if t.get("type") == "ORDER_FILL" and "pl" in t:
-            inc += float(t["pl"])
-        if t.get("type") == "TRADE_CLOSE" and "pl" in t:
-            inc += float(t["pl"])
-    return inc
-
-def latest_sentiment():
-    """
-    Pull the latest sentiment snapshot produced by news_sentiment.py.
-    Return list of tuples: (instrument, sentiment, timestamp).
-    Positive => buy; negative => sell.
-    """
+def latest_news():
     try:
-        j = get("/accounts/{}/summary".format(ACC))  # quick ping to confirm auth
-    except:
+        if NEWS_PATH.exists():
+            return json.loads(NEWS_PATH.read_text())
+    except Exception:
         pass
-    # Replace this with your actual sentiment source.
-    # For now, assume news_sentiment.py stores a file/endpoint you already wired.
-    # Example (very simple stub): always returns neutral except every few polls.
-    t = now_utc().second
-    fake = []
-    for inst in INSTRUMENTS:
-        s = 0.0
-        if t % 4 == 0: s = 0.2     # triggers BUY
-        if t % 6 == 0: s = -0.2    # triggers SELL sometimes
-        fake.append((inst, s, now_utc()))
-    return fake
+    return {}
 
-def pricing(inst):
-    j = get("/pricing", params={"instruments": inst, "accountId": ACC})
-    p = j["prices"][0]
-    bid = float(p["bids"][0]["price"])
-    ask = float(p["asks"][0]["price"])
-    return bid, ask, p
+def place_real_trade(inst: str, units: int, tp_pips: int, sl_pips: int):
+    """Places a REAL market order with TP/SL. Returns (ok, payload_dict)."""
+    try:
+        pip = PIP_MAP.get(inst, 0.0001)
+        bid, ask = fetch_quote(inst)
+        is_buy = units > 0
+        entry  = ask if is_buy else bid
+        tp     = entry + (tp_pips * pip if is_buy else -tp_pips * pip)
+        sl     = entry - (sl_pips * pip if is_buy else -sl_pips * pip)
 
-def enough_time_since_last_trade():
-    global last_trade_time
-    if last_trade_time is None:
-        return True
-    return (now_utc() - last_trade_time) >= timedelta(minutes=TRADE_INTERVAL)
-
-def can_open_more():
-    return len(open_trades()) < MAX_CONCURRENT
-
-def compute_units(inst, risk_usd, sl_pips):
-    pip = PIP.get(inst, 0.0001)
-    # For majors: 1 unit ≈ pip value of pip
-    # risk per unit = sl_pips * pip value
-    risk_per_unit = sl_pips * pip
-    if risk_per_unit <= 0: return 0
-    units = int(max(1, risk_usd / risk_per_unit))
-    return units
-
-def place(inst, side, tp_pips, sl_pips):
-    bid, ask, _ = pricing(inst)
-    spread = ask - bid
-    if spread > MIN_SPREAD:
-        return False, f"Spread too wide ({spread:.5f} > {MIN_SPREAD})"
-
-    acc = account_summary()
-    bal = float(acc["balance"])
-    risk_usd = bal * RISK_PCT
-
-    pip = PIP.get(inst, 0.0001)
-    entry = ask if side == "BUY" else bid
-    tp = entry + (tp_pips * pip if side == "BUY" else -tp_pips * pip)
-    sl = entry - (sl_pips * pip if side == "BUY" else -sl_pips * pip)
-
-    units = compute_units(inst, risk_usd, sl_pips)
-    if units <= 0:
-        return False, "Units computed as 0"
-
-    units = units if side == "BUY" else -units
-    body = {
-        "order": {
-            "type": "MARKET",
-            "instrument": inst,
-            "units": str(units),
-            "timeInForce": "FOK",
-            "positionFill": "DEFAULT",
-            "takeProfitOnFill": {"price": f"{tp:.5f}", "timeInForce": "GTC"},
-            "stopLossOnFill":  {"price": f"{sl:.5f}", "timeInForce": "GTC"}
+        body = {
+            "order": {
+                "type": "MARKET",
+                "instrument": inst,
+                "units": str(units),
+                "timeInForce": "FOK",
+                "positionFill": "DEFAULT",
+                "takeProfitOnFill": {"price": fmt_price(inst, tp)},
+                "stopLossOnFill":  {"price": fmt_price(inst, sl), "timeInForce": "GTC"},
+            }
         }
-    }
-    r = post(f"/accounts/{ACC}/orders", body)
-    ok = r.status_code in (200, 201)
-    return ok, r.text[:400]
-
-def loop():
-    global last_trade_time, daily_pl
-    while True:
+        r = post(f"/accounts/{ACC}/orders", body)
+        ok = r.status_code in (200, 201)
+        payload = {}
         try:
-            reset_daily_if_needed()
+            payload = r.json()
+        except Exception:
+            payload = {"raw": r.text}
+        return ok, payload, entry, tp, sl
+    except Exception as e:
+        return False, {"error": str(e)}, None, None, None
 
-            # apply daily stop
-            inc = recent_pl_increment(2)
-            daily_pl += inc
-            if daily_pl <= -abs(MAX_DAILY_LOSS):
-                print(f"[halt] daily loss {daily_pl:.2f} <= -{MAX_DAILY_LOSS}, pausing until UTC midnight")
-                time.sleep(60)
-                continue
+def build_last_trade_payload(inst: str, side: str, units_abs: int, entry: float, tp: float, sl: float):
+    sig = latest_news()
+    return {
+        "instrument": inst,
+        "side": side,
+        "units": units_abs,
+        "price": float(entry),
+        "tp": float(tp),
+        "sl": float(sl),
+        "sentiment": sig.get("sentiment"),
+        "headline": sig.get("headline") or sig.get("title"),
+        "url": sig.get("url") or sig.get("link"),
+        "time": now_utc(),
+    }
 
-            # throttle
-            if not enough_time_since_last_trade():
-                time.sleep(POLL_SEC)
-                continue
+def main_loop():
+    print("[bot] starting test worker; ENABLE_TRADING =", ENABLE_TRADING, flush=True)
+    last_fake_at = 0.0
+    fake_interval = 30.0  # seconds
+    hb_interval   = 10.0  # seconds
+    last_hb_at    = 0.0
 
-            # check open concurrency
-            if not can_open_more():
-                time.sleep(POLL_SEC)
-                continue
+    while True:
+        t = time.time()
 
-            # get latest sentiment
-            snaps = latest_sentiment()
-            fired = False
-            for inst, s, ts in snaps:
-                if inst not in INSTRUMENTS:
-                    continue
-                if s >= SENT_THRESH:
-                    ok, msg = place(inst, "BUY", TP_PIPS, SL_PIPS)
-                    print(f"[trade BUY {inst}] {ok} {msg}")
-                    fired = fired or ok
-                elif s <= -SENT_THRESH:
-                    ok, msg = place(inst, "SELL", TP_PIPS, SL_PIPS)
-                    print(f"[trade SELL {inst}] {ok} {msg}")
-                    fired = fired or ok
+        # Heartbeat every ~10s
+        if t - last_hb_at >= hb_interval:
+            write_heartbeat()
+            last_hb_at = t
 
-                # If one trade was placed, mark time and optionally respect COOLDOWN
-                if fired:
-                    last_trade_time = now_utc()
-                    # COOLDOWN_MIN can be zero (constant churn). TRADE_INTERVAL is the main global throttle.
-                    if COOLDOWN_MIN > 0:
-                        time.sleep(int(COOLDOWN_MIN * 60))
-                    break
+        # Every ~30s: either do a real tiny trade (if enabled) or write a fake last-trade snapshot
+        if t - last_fake_at >= fake_interval:
+            last_fake_at = t
 
-        except Exception as e:
-            print("[error loop]", e)
+            if ENABLE_TRADING:
+                # REAL tiny trade
+                units = UNITS_DEFAULT  # positive=BUY, negative=SELL if desired
+                ok, payload, entry, tp, sl = place_real_trade(INSTRUMENT, units, TP_PIPS, SL_PIPS)
+                side = "BUY" if units > 0 else "SELL"
 
-        time.sleep(POLL_SEC)
+                if ok and entry is not None:
+                    snap = build_last_trade_payload(INSTRUMENT, side, abs(units), entry, tp, sl)
+                    write_last_trade_snapshot(snap)
+                    print(f"[bot] placed real trade: {snap}", flush=True)
+                else:
+                    # write a failure snapshot for visibility
+                    fail = {
+                        "instrument": INSTRUMENT, "side": side, "units": abs(units),
+                        "price": None, "tp": None, "sl": None,
+                        "headline": "Order failed",
+                        "url": None,
+                        "sentiment": None,
+                        "error": payload,
+                        "time": now_utc(),
+                    }
+                    write_last_trade_snapshot(fail)
+                    print(f"[bot] order failed: {payload}", flush=True)
+            else:
+                # FAKE snapshot to prove dashboard piping works
+                pip = PIP_MAP.get(INSTRUMENT, 0.0001)
+                fake_entry = 1.16000
+                fake_tp    = fake_entry + TP_PIPS * pip
+                fake_sl    = fake_entry - SL_PIPS * pip
+                snap = {
+                    "instrument": INSTRUMENT,
+                    "side": "BUY",
+                    "units": UNITS_DEFAULT,
+                    "price": fake_entry,
+                    "tp": fake_tp,
+                    "sl": fake_sl,
+                    "sentiment": 0.2,
+                    "headline": "Synthetic test trade (no real order placed)",
+                    "url": "https://example.com/test",
+                    "time": now_utc(),
+                }
+                write_last_trade_snapshot(snap)
+                print("[bot] wrote fake last_trade snapshot", flush=True)
+
+        time.sleep(1.0)
 
 if __name__ == "__main__":
-    loop()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("[bot] stopping...", flush=True)
