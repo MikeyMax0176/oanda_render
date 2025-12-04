@@ -1,0 +1,40 @@
+services:
+  # --- Web (Streamlit dashboard) ---
+  - type: web
+    name: oanda-dashboard
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      bash start.sh
+    envVars:
+      - key: OANDA_HOST
+        sync: false
+      - key: OANDA_ACCOUNT
+        sync: false
+      - key: OANDA_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+    autoDeploy: true
+
+  # --- Background Worker (News/Sentiment → OANDA) ---
+  - type: worker
+    name: oanda-news-worker
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      python -u news_sentiment.py
+    envVars:
+      - key: OANDA_HOST
+        sync: false
+      - key: OANDA_ACCOUNT
+        sync: false
+      - key: OANDA_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+    autoDeploy: true
