@@ -1,71 +1,83 @@
-# news_sentiment.py  (full replacement)
-import os, time, json, math, requests, logging, sys, pathlib
+# news_sentiment.py — GDELT-powered news → sentiment → OANDA trades
+import os, time, json, math, logging, requests
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
 
-# ----- runtime dirs / logging / heartbeat -----
-RUNTIME_DIR = pathlib.Path("runtime")
-RUNTIME_DIR.mkdir(exist_ok=True)
-LOG_PATH = RUNTIME_DIR / "news.log"
-HB_PATH  = RUNTIME_DIR / "bot_heartbeat.json"
-STATE_FN = RUNTIME_DIR / "news_state.json"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_PATH, encoding="utf-8")]
-)
-log = logging.getLogger("newsbot")
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def write_heartbeat(**kwargs):
-    hb = {
-        "last_run_utc": now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        **kwargs,
-    }
-    HB_PATH.write_text(json.dumps(hb, ensure_ascii=False))
-
-# ====== ENV ======
+# ---------- OANDA / ENV ----------
 HOST  = os.environ["OANDA_HOST"]
 TOKEN = os.environ["OANDA_TOKEN"]
 ACC   = os.environ["OANDA_ACCOUNT"]
 API   = f"{HOST}/v3"
 H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-NEWSAPI_KEY      = os.getenv("NEWSAPI_KEY", "")
-INSTRUMENTS      = [s.strip() for s in os.getenv("INSTRUMENTS", "EUR_USD,GBP_USD").split(",") if s.strip()]
-NEWS_INTERVAL    = int(os.getenv("NEWS_INTERVAL_SEC", "180"))
-COOLDOWN_MIN     = int(os.getenv("NEWS_COOLDOWN_MIN", "30"))
-MAX_POS_PER_INST = int(os.getenv("MAX_POS_PER_INST", "1"))
-DAILY_LOSS_CAP_PCT   = float(os.getenv("DAILY_LOSS_CAP_PCT", "2.0"))   # pause day if drawdown exceeds this %
-RISK_PER_TRADE_PCT   = float(os.getenv("RISK_PER_TRADE_PCT", "0.25"))  # risk % of NAV to SL per trade
-TP_PIPS = int(os.getenv("TP_PIPS", "50"))
-SL_PIPS = int(os.getenv("SL_PIPS", "25"))
+# Instruments (comma separated ENV). Defaults are safe.
+INSTRUMENTS = [s.strip() for s in os.getenv("INSTRUMENTS", "EUR_USD,GBP_USD").split(",") if s.strip()]
 
-# pip sizes for quick TP/SL math (approx for USD-quoted)
+# Loop / risk controls
+NEWS_INTERVAL       = int(os.getenv("NEWS_INTERVAL_SEC", "180"))    # seconds between loops
+COOLDOWN_MIN        = int(os.getenv("NEWS_COOLDOWN_MIN", "30"))     # minutes between trades per instrument
+MAX_POS_PER_INST    = int(os.getenv("MAX_POS_PER_INST", "1"))       # 1 = at most one open side per instrument
+DAILY_LOSS_CAP_PCT  = float(os.getenv("DAILY_LOSS_CAP_PCT", "2.0")) # pause for day if drawdown exceeds this %
+RISK_PER_TRADE_PCT  = float(os.getenv("RISK_PER_TRADE_PCT", "0.25"))# % of NAV risked to SL per trade
+TP_PIPS             = int(os.getenv("TP_PIPS", "50"))
+SL_PIPS             = int(os.getenv("SL_PIPS", "25"))
+
+# Heartbeat (dashboard reads this)
+HEARTBEAT_FN = "runtime/bot_heartbeat.json"
+
+# Lightweight persistent state
+STATE_FN = "/tmp/news_state.json"
+
+# Pip sizes (approx)
 PIPS = {"EUR_USD":0.0001, "GBP_USD":0.0001, "USD_JPY":0.01, "XAU_USD":0.1}
 
-# query terms per instrument for NewsAPI
-QMAP = {
-    "EUR_USD": ["eurusd","euro","ecb","eurozone","europe inflation"],
-    "GBP_USD": ["gbpusd","pound","bank of england","uk inflation"],
-    "USD_JPY": ["usdjpy","yen","boj","japan inflation"],
-    "XAU_USD": ["xauusd","gold price","gold"],
+# Per-instrument keyword bundles for filtering / queries
+KEYWORDS = {
+    "EUR_USD": ["eurusd", "\"eur usd\"", "euro", "\"european central bank\"", "ecb"],
+    "GBP_USD": ["gbpusd", "\"gbp usd\"", "pound", "\"bank of england\"", "boe", "sterling"],
+    "USD_JPY": ["usdjpy", "\"usd jpy\"", "yen", "\"bank of japan\"", "boj"],
+    "XAU_USD": ["xauusd", "\"xau usd\"", "gold", "bullion"],
 }
 
-# ====== HELPERS ======
+# ---------- Logging ----------
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+log = logging.getLogger("gdelt-bot")
+
+# ---------- Small utils ----------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
 def load_state():
     try:
-        return json.loads(STATE_FN.read_text())
+        with open(STATE_FN, "r") as f:
+            return json.load(f)
     except Exception:
         return {"seen":{}, "last_trade_at":{}, "day_nav_start":None, "day_nav_start_date":None, "paused_today":False}
 
 def save_state(s):
-    STATE_FN.write_text(json.dumps(s))
+    try:
+        with open(STATE_FN, "w") as f:
+            json.dump(s, f)
+    except Exception as e:
+        log.warning("state save failed: %s", e)
 
-def _retryable(status):
-    return status in (429, 500, 502, 503, 504)
+def write_heartbeat(**kw):
+    hb = {
+        "last_run_utc": now_utc().replace(microsecond=0).isoformat().replace("+00:00","Z"),
+        "loop_seconds": NEWS_INTERVAL,
+        "last_headline": kw.get("headline",""),
+        "last_signal": kw.get("signal","idle"),
+        "last_action": kw.get("action","idle"),
+        "notes": kw.get("notes",""),
+    }
+    try:
+        os.makedirs(os.path.dirname(HEARTBEAT_FN), exist_ok=True)
+        with open(HEARTBEAT_FN, "w") as f:
+            json.dump(hb, f)
+    except Exception as e:
+        log.warning("heartbeat write failed: %s", e)
+
+def _retryable(status): return status in (429, 500, 502, 503, 504)
 
 def _get(path, params=None):
     url = f"{API}{path}"
@@ -74,20 +86,22 @@ def _get(path, params=None):
         if r.status_code == 200:
             return r.json()
         if _retryable(r.status_code):
-            time.sleep(0.5 * (2**i)); continue
+            time.sleep(0.75 * (2**i)); continue
         raise RuntimeError(f"GET {path} -> {r.status_code} {r.text[:240]}")
-    raise RuntimeError(f"GET {path} retries exhausted")
+    raise RuntimeError("GET retries exhausted")
 
 def _post(path, body):
     url = f"{API}{path}"
     for i in range(4):
         r = requests.post(url, headers=H, json=body, timeout=20)
-        if r.status_code in (200, 201): return r.status_code, r.text
+        if r.status_code in (200, 201):
+            return r.status_code, r.text
         if _retryable(r.status_code):
-            time.sleep(0.5 * (2**i)); continue
+            time.sleep(0.75 * (2**i)); continue
         return r.status_code, r.text
     return 599, "POST retries exhausted"
 
+# ---------- OANDA helpers ----------
 def account_nav():
     j = _get(f"/accounts/{ACC}/summary")["account"]
     return float(j.get("NAV", j["balance"]))
@@ -95,57 +109,18 @@ def account_nav():
 def get_price(inst):
     j = _get(f"/accounts/{ACC}/pricing", params={"instruments": inst})
     p = j["prices"][0]
-    bid = float(p["bids"][0]["price"])
-    ask = float(p["asks"][0]["price"])
+    bid = float(p["bids"][0]["price"]); ask = float(p["asks"][0]["price"])
     return bid, ask
 
 def fetch_candles(inst, gran="M5", count=30):
     j = _get(f"/instruments/{inst}/candles", params={"granularity": gran, "count": count, "price": "M"})
-    closes = []
-    for c in j.get("candles", []):
-        if c.get("complete"): closes.append(float(c["mid"]["c"]))
+    closes = [float(c["mid"]["c"]) for c in j.get("candles", []) if c.get("complete")]
     return closes
 
 def momentum_filter(inst, lookback=10):
     cs = fetch_candles(inst, "M5", lookback + 1)
     if len(cs) < lookback + 1: return 0.0
-    return cs[-1] - cs[-lookback]
-
-def sentiment_score(text: str) -> float:
-    pos = ["surge","beat","optimism","growth","cooling","hawkish","strong","accelerates","expands"]
-    neg = ["plunge","miss","fear","recession","hot","dovish","weak","contracts","slows"]
-    t = (text or "").lower()
-    s = sum(w in t for w in pos) - sum(w in t for w in neg)
-    return max(-2.0, min(2.0, float(s)))
-
-def fetch_headlines(q: str):
-    if not NEWSAPI_KEY:
-        return []
-    r = requests.get(
-        "https://newsapi.org/v2/everything",
-        params={"q": q, "language": "en", "pageSize": 10, "sortBy": "publishedAt"},
-        headers={"X-Api-Key": NEWSAPI_KEY},
-        timeout=20
-    )
-    if r.status_code != 200:
-        log.warning("[news] error %s %s", r.status_code, r.text[:200])
-        return []
-    arts = r.json().get("articles", [])
-    out = []
-    for a in arts:
-        aid = (a.get("url", "") + "|" + a.get("publishedAt", ""))
-        out.append({"id":aid, "title":a.get("title",""), "desc":a.get("description") or ""})
-    return out
-
-def best_news_signal(inst):
-    qs = QMAP.get(inst, [inst.lower()])
-    best = None
-    for q in qs:
-        for a in fetch_headlines(q):
-            s = sentiment_score(a["title"] + " " + a["desc"])
-            if best is None or abs(s) > abs(best[0]):
-                best = (s, a)
-    return best  # (score, article) or None
+    return cs[-1] - cs[-lookback]  # + uptrend, - downtrend
 
 def units_for_risk(inst, nav_usd, sl_pips):
     pip = PIPS.get(inst, 0.0001)
@@ -158,17 +133,16 @@ def current_positions(inst):
     j = _get(f"/accounts/{ACC}/openPositions")
     for p in j.get("positions", []):
         if p["instrument"] == inst:
-            long_u = int(p["long"]["units"])
-            short_u = int(p["short"]["units"])
-            return long_u, short_u
+            return int(p["long"]["units"]), int(p["short"]["units"])
     return 0, 0
 
-def place_market(inst, buy: bool, units_abs: int, headline: str | None):
+def place_market(inst, buy: bool, units_abs: int):
     bid, ask = get_price(inst)
     pip = PIPS.get(inst, 0.0001)
     entry = ask if buy else bid
     tp = entry + (TP_PIPS * pip if buy else -TP_PIPS * pip)
     sl = entry - (SL_PIPS * pip if buy else -SL_PIPS * pip)
+    fmt = "{:.5f}"
     body = {
         "order": {
             "type": "MARKET",
@@ -176,23 +150,80 @@ def place_market(inst, buy: bool, units_abs: int, headline: str | None):
             "units": str(units_abs if buy else -units_abs),
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "takeProfitOnFill": {"price": f"{tp:.5f}"},
-            "stopLossOnFill":  {"price": f"{sl:.5f}"},
+            "takeProfitOnFill": {"price": fmt.format(tp)},
+            "stopLossOnFill":  {"price": fmt.format(sl)},
         }
     }
     code, txt = _post(f"/accounts/{ACC}/orders", body)
-    msg = f"[trade] {inst} {'BUY' if buy else 'SELL'} {units_abs} -> {code}"
-    if headline: msg += f" | headline={headline[:140]}"
-    log.info(msg)
-    # reflect in heartbeat immediately
-    write_heartbeat(last_headline=headline, last_action=f"order {code}", last_signal=("BUY" if buy else "SELL"))
+    log.info("[trade] %s %s %s -> %s %s", inst, "BUY" if buy else "SELL", units_abs, code, txt[:180])
+    return code, txt
 
-# ====== MAIN LOOP ======
+# ---------- Sentiment ----------
+def sentiment_score(text: str) -> float:
+    # Tiny dictionary approach; fast and transparent
+    pos = ["surge","beat","optimism","growth","cooling","hawkish","strong","accelerates","expands","rises","eases","slows inflation"]
+    neg = ["plunge","miss","fear","recession","hot","dovish","weak","contracts","slows","falls","spikes inflation"]
+    t = (text or "").lower()
+    s = sum(w in t for w in pos) - sum(w in t for w in neg)
+    return max(-2.0, min(2.0, float(s)))
+
+# ---------- GDELT Doc 2.0 ----------
+# Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
+# We'll query recent window (e.g., 15min) and compute our own sentiment.
+GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+def gdelt_query(q: str, timespan: str = "15min", maxrecords: int = 50) -> list[dict]:
+    """Return list of article dicts with 'title','url','seendate','language'."""
+    params = {
+        "query": q,
+        "mode": "ArtList",
+        "sort": "datedesc",
+        "timespan": timespan,      # e.g., 15min, 1h, 3h
+        "maxrecords": str(maxrecords),
+        "format": "json",
+    }
+    r = requests.get(GDELT_DOC_ENDPOINT, params=params, timeout=20)
+    if r.status_code != 200:
+        log.warning("[gdelt] %s %s", r.status_code, r.text[:200])
+        return []
+    data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+    arts = data.get("articles", []) if isinstance(data, dict) else []
+    out = []
+    for a in arts:
+        out.append({
+            "id": f"{a.get('url','')}|{a.get('seendate','')}",
+            "title": a.get("title","") or "",
+            "desc": a.get("excerpt","") or "",
+            "url": a.get("url","") or "",
+            "seendate": a.get("seendate",""),
+            "lang": a.get("language",""),
+        })
+    return out
+
+def build_inst_query(inst: str) -> str:
+    # Join the instrument’s keyword list into a single OR query.
+    keys = KEYWORDS.get(inst, [inst.replace("_"," ")])
+    # GDELT query syntax is simple text; we’ll OR them.
+    return " OR ".join(keys)
+
+def best_news_signal(inst: str):
+    # One GDELT call per instrument (still light; INSTRUMENTS is short)
+    q = build_inst_query(inst)
+    arts = gdelt_query(q=q, timespan="1h", maxrecords=75)
+    if not arts:
+        return None
+    best = None
+    for a in arts:
+        s = sentiment_score(a["title"] + " " + a["desc"])
+        if (best is None) or (abs(s) > abs(best[0])):
+            best = (s, a)
+    return best  # (score, article) or None
+
+# ---------- Main loop ----------
 def main():
-    log.info("[boot] news_sentiment worker starting… instruments=%s interval=%ss", INSTRUMENTS, NEWS_INTERVAL)
     state = load_state()
 
-    # daily reset for loss cap
+    # Daily reset for loss cap
     today = now_utc().date().isoformat()
     if state.get("day_nav_start_date") != today:
         start_nav = account_nav()
@@ -203,8 +234,12 @@ def main():
         log.info("[init] New trading day. NAV start=%.2f", start_nav)
 
     while True:
-        loop_note = ""
+        last_headline = ""
+        last_signal = "idle"
+        last_action  = "idle"
+
         try:
+            # Loss guard
             nav = account_nav()
             start = float(state.get("day_nav_start") or nav)
             dd = (nav - start) / start * 100.0 if start > 0 else 0.0
@@ -214,22 +249,18 @@ def main():
                     save_state(state)
                     log.warning("[guard] Daily loss cap hit (%.2f%%). Pausing until next day.", dd)
             if state.get("paused_today"):
-                write_heartbeat(loop_seconds=NEWS_INTERVAL, last_headline=None, last_signal="PAUSED", last_action="paused", notes=f"drawdown {dd:.2f}%")
-                time.sleep(NEWS_INTERVAL)
-                continue
+                write_heartbeat(signal="paused", action="idle", headline="Daily loss cap pause", notes=f"DD={dd:.2f}%")
+                time.sleep(NEWS_INTERVAL); continue
 
-            last_headline = None
-            last_signal   = "HOLD"
-            last_action   = "idle"
-
+            # Per instrument
             for inst in INSTRUMENTS:
-                # limit concurrent positions
+                # avoid multiple concurrent positions on same side
                 long_u, short_u = current_positions(inst)
                 open_slots = (1 if long_u else 0) + (1 if short_u else 0)
                 if open_slots >= MAX_POS_PER_INST:
                     continue
 
-                # cooldown
+                # cooldown check
                 last_iso = state.get("last_trade_at", {}).get(inst)
                 if last_iso:
                     try:
@@ -243,37 +274,42 @@ def main():
                 if not sig:
                     continue
                 score, art = sig
-                headline = (art.get("title") or "").strip()
-                desc = (art.get("desc") or "").strip()
-                last_headline = headline or desc or None
+                last_headline = art["title"]
 
                 # momentum agreement
                 mom = momentum_filter(inst, lookback=10)
 
                 action = "HOLD"
-                if score >= 1.0 and mom > 0: action = "BUY"
-                elif score <= -1.0 and mom < 0: action = "SELL"
+                if score >= 1.0 and mom > 0:
+                    action = "BUY"
+                elif score <= -1.0 and mom < 0:
+                    action = "SELL"
 
-                log.info("[news] %s score=%+.2f mom=%+.5f -> %s | %s", inst, score, mom, action, (headline or "")[:120])
+                log.info("[news] %s score=%+0.2f mom=%+0.5f -> %s | %s",
+                         inst, score, mom, action, (art["title"] or "")[:120])
+                last_signal = action if action in ("BUY","SELL") else "HOLD"
 
-                if action in ("BUY", "SELL"):
+                if action in ("BUY","SELL"):
                     nav = account_nav()
                     units = units_for_risk(inst, nav, SL_PIPS)
                     if units > 0:
-                        place_market(inst, buy=(action == "BUY"), units_abs=units, headline=last_headline)
-                        state.setdefault("last_trade_at", {})[inst] = now_utc().isoformat()
-                        save_state(state)
-                        last_signal = action
-                        last_action = "placed order"
-                        break  # one trade per loop is enough
-
-            write_heartbeat(loop_seconds=NEWS_INTERVAL, last_headline=last_headline, last_signal=last_signal, last_action=last_action, notes=loop_note)
+                        code, _ = place_market(inst, buy=(action=="BUY"), units_abs=units)
+                        if str(code).startswith("20"):
+                            state.setdefault("last_trade_at", {})[inst] = now_utc().isoformat()
+                            save_state(state)
+                            last_action = f"{action} {units}"
+                        else:
+                            last_action = f"order_err_{code}"
 
         except Exception as e:
-            log.exception("[loop] error: %s", e)
-            write_heartbeat(loop_seconds=NEWS_INTERVAL, last_headline=None, last_signal="ERROR", last_action="exception", notes=str(e))
+            log.error("[loop] error: %s", e)
+            last_signal = "error"
+            last_action = "idle"
 
+        write_heartbeat(signal=last_signal, action=last_action, headline=last_headline, notes="")
         time.sleep(NEWS_INTERVAL)
 
 if __name__ == "__main__":
+    log.info("[boot] news_sentiment worker starting (GDELT)… instruments=%s interval=%ss",
+             INSTRUMENTS, NEWS_INTERVAL)
     main()
