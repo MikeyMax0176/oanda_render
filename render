@@ -1,13 +1,10 @@
 services:
-  # --- Web (Streamlit dashboard) ---
   - type: web
     name: oanda-dashboard
     env: python
     plan: starter
-    buildCommand: |
-      pip install -r requirements.txt
-    startCommand: |
-      bash start.sh
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run dashboard.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
     envVars:
       - key: OANDA_HOST
         sync: false
@@ -15,19 +12,27 @@ services:
         sync: false
       - key: OANDA_TOKEN
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-    autoDeploy: true
+      - key: INSTRUMENTS
+        value: EUR_USD,GBP_USD
+      - key: NEWS_INTERVAL_SEC
+        value: "180"
+      - key: NEWS_COOLDOWN_MIN
+        value: "30"
+      - key: DAILY_LOSS_CAP_PCT
+        value: "2.0"
+      - key: RISK_PER_TRADE_PCT
+        value: "0.25"
+      - key: TP_PIPS
+        value: "50"
+      - key: SL_PIPS
+        value: "25"
 
-  # --- Background Worker (News/Sentiment → OANDA) ---
   - type: worker
-    name: oanda-news-worker
+    name: oanda-news-bot
     env: python
     plan: starter
-    buildCommand: |
-      pip install -r requirements.txt
-    startCommand: |
-      python -u news_sentiment.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u news_sentiment.py
     envVars:
       - key: OANDA_HOST
         sync: false
@@ -35,6 +40,17 @@ services:
         sync: false
       - key: OANDA_TOKEN
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-    autoDeploy: true
+      - key: INSTRUMENTS
+        value: EUR_USD,GBP_USD
+      - key: NEWS_INTERVAL_SEC
+        value: "180"
+      - key: NEWS_COOLDOWN_MIN
+        value: "30"
+      - key: DAILY_LOSS_CAP_PCT
+        value: "2.0"
+      - key: RISK_PER_TRADE_PCT
+        value: "0.25"
+      - key: TP_PIPS
+        value: "50"
+      - key: SL_PIPS
+        value: "25"
