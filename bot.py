@@ -9,6 +9,9 @@ import requests
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# Import database layer
+import db
+
 # ========= ENV & CONSTANTS =========
 HOST = os.environ["OANDA_HOST"]
 TOKEN = os.environ["OANDA_TOKEN"]
@@ -202,11 +205,21 @@ def record_last_trade_headline(headline: str, sentiment: float, side: str):
 # ========= Main loop =========
 def main():
     print("[bot] starting…")
+    
+    # Initialize database
+    db.init_db()
+    
     last_trade_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     while True:
         loop_started = now_utc()
         try:
+            # Check if bot is enabled
+            if not db.get_bot_enabled():
+                print("[bot] disabled, sleeping...")
+                time.sleep(10)
+                continue
+            
             # update heartbeat up-front so the light is green soon after start
             write_heartbeat()
 
@@ -229,11 +242,28 @@ def main():
 
             # news sentiment
             chosen = None
+            all_titles = []
             try:
-                titles = fetch_headlines(limit=10)
-                chosen = best_headline_with_sentiment(titles)
+                all_titles = fetch_headlines(limit=10)
+                chosen = best_headline_with_sentiment(all_titles)
             except Exception as e:
                 print(f"[bot] news error: {e}")
+
+            # Log all fetched articles to database
+            for title in all_titles:
+                try:
+                    sent = analyzer.polarity_scores(title)["compound"]
+                    db.log_article(
+                        published_at=now_utc().isoformat(),
+                        source="Reuters RSS",
+                        title=title,
+                        sentiment=sent,
+                        instrument=INSTRUMENT,
+                        url=None,
+                        raw_data={"title": title, "score": sent}
+                    )
+                except Exception as e:
+                    print(f"[bot] error logging article: {e}")
 
             # decide trade
             should_trade = False
@@ -268,6 +298,40 @@ def main():
                       f"TP={tp:.{DIGITS}f} SL={sl:.{DIGITS}f} headline='{headline[:80]}' sent={sentiment:+.2f}")
 
                 r = place_market(units_signed, tp, sl)
+                trade_status = "FILLED" if r.status_code in (200, 201) else "REJECTED"
+                
+                # Extract order ID and fill price from response
+                order_id = None
+                fill_price = None
+                raw_response = {}
+                
+                try:
+                    raw_response = r.json()
+                    if "orderFillTransaction" in raw_response:
+                        fill_tx = raw_response["orderFillTransaction"]
+                        order_id = fill_tx.get("orderID")
+                        fill_price = float(fill_tx.get("price", 0))
+                    elif "orderCreateTransaction" in raw_response:
+                        order_id = raw_response["orderCreateTransaction"].get("id")
+                except Exception as e:
+                    print(f"[bot] error parsing response: {e}")
+                
+                # Log trade to database
+                notional = abs(units_signed) * (fill_price if fill_price else entry) / 10000  # approximate USD
+                db.log_trade(
+                    ts=now_utc().isoformat(),
+                    instrument=INSTRUMENT,
+                    side=side,
+                    units=units_signed,
+                    notional_usd=notional,
+                    sentiment=sentiment,
+                    headline=headline,
+                    order_id=order_id,
+                    status=trade_status,
+                    fill_price=fill_price,
+                    raw_data=raw_response
+                )
+                
                 if r.status_code in (200, 201):
                     print("[bot] order OK", r.status_code)
                     last_trade_time = now_utc()

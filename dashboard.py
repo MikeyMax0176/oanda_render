@@ -7,6 +7,10 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 import streamlit as st
+import pandas as pd
+
+# Import database layer
+import db
 
 # =========================
 # ENV / OANDA API WIRES
@@ -110,7 +114,98 @@ except Exception as e:
 
 st.divider()
 
-# ---------- Status Light + Bot Panel ----------
+# ---------- Bot Control Panel ----------
+st.subheader("🤖 Bot Control")
+
+# Initialize database
+db.init_db()
+
+col1, col2, col3 = st.columns([1, 2, 2])
+
+with col1:
+    # Get current bot state
+    bot_enabled = db.get_bot_enabled()
+    
+    # Display status indicator
+    if bot_enabled:
+        st.markdown("### 🟢 RUNNING")
+    else:
+        st.markdown("### 🔴 STOPPED")
+
+with col2:
+    # Start/Stop buttons
+    if st.button("▶️ START BOT", disabled=bot_enabled, use_container_width=True):
+        db.set_bot_enabled(True)
+        st.success("Bot started!")
+        st.rerun()
+    
+    if st.button("⏹️ STOP BOT", disabled=not bot_enabled, use_container_width=True):
+        db.set_bot_enabled(False)
+        st.warning("Bot stopped!")
+        st.rerun()
+
+with col3:
+    # Status information
+    st.caption(f"**Status:** {'Enabled' if bot_enabled else 'Disabled'}")
+    last = read_last_trade_json()
+    if last:
+        st.caption(f"**Last Trade:** {last.get('side','?')} {last.get('instrument','?')}")
+
+st.divider()
+
+# ---------- Recent Articles Table ----------
+st.subheader("📰 Recent News Articles")
+try:
+    articles = db.get_recent_articles(limit=20)
+    if articles:
+        df_articles = pd.DataFrame(articles)
+        # Format for display
+        df_articles['sentiment'] = df_articles['sentiment'].apply(lambda x: f"{x:+.3f}")
+        display_cols = ['published_at', 'source', 'title', 'sentiment', 'instrument']
+        st.dataframe(
+            df_articles[display_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.caption("No articles logged yet. Bot will log articles once started.")
+except Exception as e:
+    st.error(f"Error loading articles: {e}")
+
+st.divider()
+
+# ---------- Recent Trades Table ----------
+st.subheader("💼 Recent Trades")
+try:
+    trades = db.get_recent_trades(limit=20)
+    if trades:
+        df_trades = pd.DataFrame(trades)
+        # Format for display
+        df_trades['sentiment'] = df_trades['sentiment'].apply(lambda x: f"{x:+.3f}")
+        if 'fill_price' in df_trades.columns:
+            df_trades['fill_price'] = df_trades['fill_price'].apply(
+                lambda x: f"{x:.5f}" if x else "—"
+            )
+        if 'notional_usd' in df_trades.columns:
+            df_trades['notional_usd'] = df_trades['notional_usd'].apply(
+                lambda x: f"${x:.2f}" if x else "—"
+            )
+        display_cols = ['ts', 'instrument', 'side', 'units', 'fill_price', 
+                       'sentiment', 'status', 'headline']
+        available_cols = [col for col in display_cols if col in df_trades.columns]
+        st.dataframe(
+            df_trades[available_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.caption("No trades logged yet. Bot will log trades once it executes orders.")
+except Exception as e:
+    st.error(f"Error loading trades: {e}")
+
+st.divider()
+
+# ---------- Status Light + API Health ----------
 status_col, bot_col = st.columns([1, 3])
 
 # Status light is green if pricing call succeeds; red otherwise
@@ -122,12 +217,12 @@ with status_col:
             light = "🟢"
     except Exception:
         light = "🔴"
-    st.subheader("Status")
+    st.subheader("API Status")
     st.markdown(f"# {light}")
-    st.caption("Green = API healthy / dashboard running")
+    st.caption("Green = OANDA API healthy")
 
 with bot_col:
-    st.subheader("Bot Status")
+    st.subheader("Last Trade Details")
     last = read_last_trade_json()
     if last:
         st.markdown(
@@ -141,7 +236,7 @@ with bot_col:
         else:
             st.caption("No headline recorded yet.")
     else:
-        st.caption("No last-trade file found. When the bot trades, it should write `last_trade.json` next to this file.")
+        st.caption("No last-trade file found.")
 
 st.divider()
 
