@@ -1,112 +1,144 @@
 # db.py
-import sqlite3
-import json
+"""
+Database layer with SQLAlchemy support for Postgres (production) and SQLite (local dev).
+Uses DATABASE_URL env var if present, otherwise falls back to local SQLite.
+"""
 import os
+import json
 from datetime import datetime, timezone
-from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
-DB_PATH = os.getenv("DB_PATH", "/opt/render/project/src/runtime/bot.db")
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Text, Boolean,
+    CheckConstraint
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.pool import StaticPool
 
-# Ensure directory exists
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# Get DATABASE_URL (Postgres on Render) or fall back to SQLite
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DB_PATH = os.getenv("DB_PATH", "/opt/render/project/src/runtime/bot.db")
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    DATABASE_URL = f"sqlite:///{DB_PATH}"
+    print(f"[db] Using SQLite: {DB_PATH}")
+else:
+    print(f"[db] Using DATABASE_URL: {DATABASE_URL[:30]}...")
+
+# Create engine with appropriate settings
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=False
+    )
+else:
+    # Postgres/production
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 
-@contextmanager
-def get_conn():
-    """Context manager for database connections."""
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# ========= Models =========
+class BotState(Base):
+    """Single-row table to store bot enabled state."""
+    __tablename__ = "bot_state"
+    
+    id = Column(Integer, primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(String, nullable=False)
+    
+    __table_args__ = (
+        CheckConstraint("id = 1", name="single_row_check"),
+    )
+
+
+class Article(Base):
+    """News articles with sentiment scores."""
+    __tablename__ = "articles"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    published_at = Column(String, nullable=False, index=True)
+    source = Column(String, nullable=False)
+    title = Column(Text, nullable=False)
+    url = Column(String, nullable=True)
+    sentiment = Column(Float, nullable=False)
+    instrument = Column(String, nullable=False)
+    raw_json = Column(Text, nullable=False)
+
+
+class Trade(Base):
+    """Trade execution records."""
+    __tablename__ = "trades"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(String, nullable=False, index=True)
+    instrument = Column(String, nullable=False)
+    side = Column(String, nullable=False)
+    units = Column(Integer, nullable=False)
+    notional_usd = Column(Float, nullable=True)
+    sentiment = Column(Float, nullable=False)
+    headline = Column(Text, nullable=False)
+    order_id = Column(String, nullable=True)
+    status = Column(String, nullable=False)
+    fill_price = Column(Float, nullable=True)
+    raw_json = Column(Text, nullable=False)
+
+
+def get_session() -> Session:
+    """Get a new database session."""
+    return SessionLocal()
 
 
 def init_db():
     """
     Initialize database with required tables.
-    Safe to call multiple times (uses IF NOT EXISTS).
+    Safe to call multiple times - creates tables if they don't exist.
     """
-    with get_conn() as conn:
-        # bot_state: single-row table for bot enabled flag
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        
-        # Ensure one row exists
-        conn.execute("""
-            INSERT OR IGNORE INTO bot_state (id, enabled, updated_at)
-            VALUES (1, 0, ?)
-        """, (datetime.now(timezone.utc).isoformat(),))
-        
-        # articles: news articles with sentiment
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                published_at TEXT NOT NULL,
-                source TEXT NOT NULL,
-                title TEXT NOT NULL,
-                url TEXT,
-                sentiment REAL NOT NULL,
-                instrument TEXT NOT NULL,
-                raw_json TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_articles_published 
-            ON articles(published_at DESC)
-        """)
-        
-        # trades: record of all trades placed
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                instrument TEXT NOT NULL,
-                side TEXT NOT NULL,
-                units INTEGER NOT NULL,
-                notional_usd REAL,
-                sentiment REAL NOT NULL,
-                headline TEXT NOT NULL,
-                order_id TEXT,
-                status TEXT NOT NULL,
-                fill_price REAL,
-                raw_json TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_trades_ts 
-            ON trades(ts DESC)
-        """)
+    Base.metadata.create_all(bind=engine)
     
-    print(f"[db] initialized at {DB_PATH}")
+    # Ensure bot_state has exactly one row
+    session = get_session()
+    try:
+        state = session.query(BotState).filter_by(id=1).first()
+        if not state:
+            state = BotState(
+                id=1,
+                enabled=False,
+                updated_at=datetime.now(timezone.utc).isoformat()
+            )
+            session.add(state)
+            session.commit()
+    finally:
+        session.close()
+    
+    print(f"[db] initialized")
 
 
 def set_bot_enabled(enabled: bool):
     """Enable or disable the bot."""
-    with get_conn() as conn:
-        conn.execute("""
-            UPDATE bot_state 
-            SET enabled = ?, updated_at = ?
-            WHERE id = 1
-        """, (1 if enabled else 0, datetime.now(timezone.utc).isoformat()))
-    print(f"[db] bot_enabled set to {enabled}")
+    session = get_session()
+    try:
+        state = session.query(BotState).filter_by(id=1).first()
+        if state:
+            state.enabled = enabled
+            state.updated_at = datetime.now(timezone.utc).isoformat()
+            session.commit()
+            print(f"[db] bot_enabled set to {enabled}")
+    finally:
+        session.close()
 
 
 def get_bot_enabled() -> bool:
     """Check if bot is enabled."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT enabled FROM bot_state WHERE id = 1").fetchone()
-        return bool(row["enabled"]) if row else False
+    session = get_session()
+    try:
+        state = session.query(BotState).filter_by(id=1).first()
+        return state.enabled if state else False
+    finally:
+        session.close()
 
 
 def log_article(
@@ -130,12 +162,21 @@ def log_article(
         url: Optional article URL
         raw_data: Optional dict of raw article data
     """
-    raw_json = json.dumps(raw_data or {})
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO articles (published_at, source, title, url, sentiment, instrument, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (published_at, source, title, url, sentiment, instrument, raw_json))
+    session = get_session()
+    try:
+        article = Article(
+            published_at=published_at,
+            source=source,
+            title=title,
+            url=url,
+            sentiment=sentiment,
+            instrument=instrument,
+            raw_json=json.dumps(raw_data or {})
+        )
+        session.add(article)
+        session.commit()
+    finally:
+        session.close()
 
 
 def log_trade(
@@ -167,14 +208,25 @@ def log_trade(
         fill_price: Optional fill price
         raw_data: Optional dict of raw response data
     """
-    raw_json = json.dumps(raw_data or {})
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO trades (ts, instrument, side, units, notional_usd, sentiment, 
-                              headline, order_id, status, fill_price, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (ts, instrument, side, units, notional_usd, sentiment, headline, 
-              order_id, status, fill_price, raw_json))
+    session = get_session()
+    try:
+        trade = Trade(
+            ts=ts,
+            instrument=instrument,
+            side=side,
+            units=units,
+            notional_usd=notional_usd,
+            sentiment=sentiment,
+            headline=headline,
+            order_id=order_id,
+            status=status,
+            fill_price=fill_price,
+            raw_json=json.dumps(raw_data or {})
+        )
+        session.add(trade)
+        session.commit()
+    finally:
+        session.close()
 
 
 def get_recent_articles(limit: int = 50) -> List[Dict[str, Any]]:
@@ -187,15 +239,29 @@ def get_recent_articles(limit: int = 50) -> List[Dict[str, Any]]:
     Returns:
         List of article dicts
     """
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT id, published_at, source, title, url, sentiment, instrument, raw_json
-            FROM articles
-            ORDER BY published_at DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-        
-        return [dict(row) for row in rows]
+    session = get_session()
+    try:
+        articles = (
+            session.query(Article)
+            .order_by(Article.published_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": a.id,
+                "published_at": a.published_at,
+                "source": a.source,
+                "title": a.title,
+                "url": a.url,
+                "sentiment": a.sentiment,
+                "instrument": a.instrument,
+                "raw_json": a.raw_json
+            }
+            for a in articles
+        ]
+    finally:
+        session.close()
 
 
 def get_recent_trades(limit: int = 50) -> List[Dict[str, Any]]:
@@ -208,16 +274,33 @@ def get_recent_trades(limit: int = 50) -> List[Dict[str, Any]]:
     Returns:
         List of trade dicts
     """
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT id, ts, instrument, side, units, notional_usd, sentiment,
-                   headline, order_id, status, fill_price, raw_json
-            FROM trades
-            ORDER BY ts DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-        
-        return [dict(row) for row in rows]
+    session = get_session()
+    try:
+        trades = (
+            session.query(Trade)
+            .order_by(Trade.ts.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "ts": t.ts,
+                "instrument": t.instrument,
+                "side": t.side,
+                "units": t.units,
+                "notional_usd": t.notional_usd,
+                "sentiment": t.sentiment,
+                "headline": t.headline,
+                "order_id": t.order_id,
+                "status": t.status,
+                "fill_price": t.fill_price,
+                "raw_json": t.raw_json
+            }
+            for t in trades
+        ]
+    finally:
+        session.close()
 
 
 # Initialize on import

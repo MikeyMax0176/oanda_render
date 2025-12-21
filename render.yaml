@@ -1,5 +1,12 @@
+databases:
+  # Shared PostgreSQL database
+  - name: oanda-bot-db
+    databaseName: oanda_bot
+    user: oanda_bot_user
+    plan: starter
+
 services:
-  # --- Web (Streamlit dashboard) ---
+  # --- Web (Streamlit dashboard - UI only) ---
   - type: web
     name: oanda-dashboard
     env: python
@@ -7,7 +14,7 @@ services:
     buildCommand: |
       pip install -r requirements.txt
     startCommand: |
-      bash start.sh
+      streamlit run dashboard.py --server.address 0.0.0.0 --server.port ${PORT:-10000} --server.headless true
     envVars:
       - key: OANDA_HOST
         sync: false
@@ -15,19 +22,21 @@ services:
         sync: false
       - key: OANDA_TOKEN
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: oanda-bot-db
+          property: connectionString
     autoDeploy: true
 
-  # --- Background Worker (News/Sentiment → OANDA) ---
+  # --- Worker (News sentiment + trading loop) ---
   - type: worker
-    name: oanda-news-worker
+    name: oanda-trading-worker
     env: python
     plan: starter
     buildCommand: |
       pip install -r requirements.txt
     startCommand: |
-      python -u news_sentiment.py
+      python -u worker.py
     envVars:
       - key: OANDA_HOST
         sync: false
@@ -35,6 +44,27 @@ services:
         sync: false
       - key: OANDA_TOKEN
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: oanda-bot-db
+          property: connectionString
+      - key: BOT_INSTRUMENT
+        value: EUR_USD
+      - key: BOT_TP_PIPS
+        value: "38"
+      - key: BOT_SL_PIPS
+        value: "25"
+      - key: BOT_RISK_USD
+        value: "500"
+      - key: BOT_TRADE_INTERVAL_MIN
+        value: "1"
+      - key: BOT_COOLDOWN_MIN
+        value: "0"
+      - key: BOT_MAX_CONCURRENT
+        value: "3"
+      - key: BOT_MIN_SPREAD
+        value: "0.0002"
+      - key: BOT_SENT_THRESHOLD
+        value: "0.15"
     autoDeploy: true
+

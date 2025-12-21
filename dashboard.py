@@ -1,4 +1,8 @@
 # dashboard.py
+"""
+Streamlit dashboard for OANDA news trading bot.
+UI-only - displays data from database and controls worker via bot_state.enabled flag.
+"""
 import os
 import json
 import time
