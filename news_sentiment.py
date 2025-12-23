@@ -16,15 +16,28 @@ import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ========= LOGGING SETUP =========
+# Try to set up file logging, but don't fail if directory doesn't exist
+handlers = [logging.StreamHandler(sys.stdout)]
+try:
+    log_dir = '/opt/render/project/src/runtime'
+    os.makedirs(log_dir, exist_ok=True)
+    handlers.append(logging.FileHandler(f'{log_dir}/news.log', mode='a'))
+except Exception as e:
+    print(f"Warning: Could not create file logger: {e}", flush=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/opt/render/project/src/runtime/news.log', mode='a')
-    ]
+    handlers=handlers
 )
 logger = logging.getLogger(__name__)
+
+# Print startup message immediately
+print("=" * 60, flush=True)
+print("NEWS SENTIMENT WORKER STARTING UP...", flush=True)
+print(f"Python: {sys.version}", flush=True)
+print(f"Time: {datetime.now(timezone.utc).isoformat()}", flush=True)
+print("=" * 60, flush=True)
 
 # ========= ENV & CONSTANTS =========
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", "/opt/render/project/src/runtime")
@@ -143,6 +156,10 @@ def process_news():
 # ========= MAIN LOOP =========
 def main():
     """Main worker loop."""
+    print("=" * 60, flush=True)
+    print("NEWS SENTIMENT MAIN LOOP STARTING", flush=True)
+    print("=" * 60, flush=True)
+    
     logger.info("=" * 60)
     logger.info("News Sentiment Worker Starting")
     logger.info(f"RSS URL: {RSS_URL}")
@@ -168,7 +185,12 @@ def main():
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
             logger.error(traceback.format_exc())
-            # Continue running even after error
+            print(f"ERROR in loop {loop_count}: {e}", flush=True)
+            print(f"Traceback: {traceback.format_exc()}", flush=True)
+            # Sleep 30s on error before continuing
+            print("Sleeping 30s after error...", flush=True)
+            time.sleep(30)
+            continue
             
         # Calculate sleep time
         elapsed = time.time() - loop_start
@@ -185,4 +207,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        print("Starting news_sentiment.py main()...", flush=True)
+        main()
+    except Exception as e:
+        print(f"FATAL ERROR in main: {e}", flush=True)
+        print(f"Traceback: {traceback.format_exc()}", flush=True)
+        # Sleep to prevent rapid restart loops
+        time.sleep(30)
+        sys.exit(1)
