@@ -42,9 +42,17 @@ print("=" * 60, flush=True)
 # ========= ENV & CONSTANTS =========
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", "/opt/render/project/src/runtime")
 SENTIMENT_DATA_PATH = os.getenv("SENTIMENT_DATA_PATH", f"{RUNTIME_DIR}/sentiment_data.json")
-RSS_URL = os.getenv("BOT_RSS_URL", "https://feeds.reuters.com/reuters/businessNews")
+
+# Multiple RSS feeds - try in order until we get enough headlines
+RSS_FEEDS = [
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"
+]
+
 POLL_INTERVAL_SEC = int(os.getenv("SENTIMENT_POLL_INTERVAL", "300"))  # 5 minutes default
 HEADLINES_LIMIT = int(os.getenv("SENTIMENT_HEADLINES_LIMIT", "10"))
+MIN_HEADLINES_REQUIRED = 5  # Minimum headlines needed from a feed
 
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 
@@ -65,15 +73,52 @@ def write_json_atomic(path: str, obj: dict):
     os.replace(tmp, path)
 
 
-def fetch_headlines(limit=10) -> list[str]:
-    """Fetch headlines from RSS feed."""
-    try:
-        feed = feedparser.parse(RSS_URL)
-        titles = [e.get("title", "").strip() for e in feed.entries[:limit]]
-        return [t for t in titles if t]
-    except Exception as e:
-        logger.error(f"Failed to fetch headlines: {e}")
-        return []
+def fetch_headlines(limit=10) -> tuple[list[str], str]:
+    """
+    Fetch headlines from RSS feeds with fallback logic.
+    Tries each feed in order until we get at least MIN_HEADLINES_REQUIRED headlines.
+    
+    Returns:
+        tuple: (list of headlines, source URL used)
+    """
+    for rss_url in RSS_FEEDS:
+        try:
+            logger.info(f"Trying feed: {rss_url}")
+            feed = feedparser.parse(rss_url)
+            
+            # Diagnostic logging
+            if hasattr(feed, 'bozo') and feed.bozo:
+                logger.warning(f"Feed has bozo flag set: {rss_url}")
+                if hasattr(feed, 'bozo_exception'):
+                    logger.warning(f"Bozo exception: {feed.bozo_exception}")
+            
+            if hasattr(feed, 'status'):
+                logger.info(f"Feed HTTP status: {feed.status}")
+            
+            # Extract titles
+            entries_count = len(feed.entries)
+            logger.info(f"Feed returned {entries_count} entries")
+            
+            titles = [e.get("title", "").strip() for e in feed.entries[:limit]]
+            titles = [t for t in titles if t]
+            
+            logger.info(f"Extracted {len(titles)} valid headlines from {rss_url}")
+            
+            # Check if we have enough headlines
+            if len(titles) >= MIN_HEADLINES_REQUIRED:
+                logger.info(f"✓ Using feed: {rss_url} ({len(titles)} headlines)")
+                return titles, rss_url
+            else:
+                logger.warning(f"✗ Feed {rss_url} only returned {len(titles)} headlines (need {MIN_HEADLINES_REQUIRED})")
+                
+        except Exception as e:
+            logger.error(f"Failed to fetch from {rss_url}: {e}")
+            logger.error(traceback.format_exc())
+            continue
+    
+    # All feeds failed
+    logger.warning(f"All {len(RSS_FEEDS)} RSS feeds failed to provide {MIN_HEADLINES_REQUIRED}+ headlines")
+    return [], "none"
 
 
 def analyze_sentiment(text: str) -> dict:
@@ -95,12 +140,12 @@ def process_news():
     """Main news processing logic."""
     logger.info("Fetching and analyzing news...")
     
-    headlines = fetch_headlines(limit=HEADLINES_LIMIT)
+    headlines, source_url = fetch_headlines(limit=HEADLINES_LIMIT)
     if not headlines:
-        logger.warning("No headlines found")
+        logger.warning("No headlines found from any RSS feed - will retry on next loop")
         return
     
-    logger.info(f"Found {len(headlines)} headlines")
+    logger.info(f"Processing {len(headlines)} headlines from: {source_url}")
     
     # Analyze all headlines
     analyzed = []
@@ -135,7 +180,7 @@ def process_news():
     # Write results
     result = {
         "last_update": now_utc().isoformat(),
-        "source": RSS_URL,
+        "source": source_url,
         "headlines_count": len(headlines),
         "average_sentiment": avg_compound,
         "best_positive": {
@@ -162,7 +207,10 @@ def main():
     
     logger.info("=" * 60)
     logger.info("News Sentiment Worker Starting")
-    logger.info(f"RSS URL: {RSS_URL}")
+    logger.info(f"RSS Feeds (in priority order):")
+    for i, feed_url in enumerate(RSS_FEEDS, 1):
+        logger.info(f"  {i}. {feed_url}")
+    logger.info(f"Minimum headlines required: {MIN_HEADLINES_REQUIRED}")
     logger.info(f"Poll Interval: {POLL_INTERVAL_SEC}s")
     logger.info(f"Runtime Dir: {RUNTIME_DIR}")
     logger.info("=" * 60)
