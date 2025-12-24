@@ -27,7 +27,7 @@ services:
     buildCommand: |
       pip install -r requirements.txt
     startCommand: |
-      python -u news_sentiment.py
+      python -u bot.py
     envVars:
       - key: OANDA_HOST
         sync: false
@@ -37,4 +37,16 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: DRY_RUN
+        value: "true"
+      - key: BOT_SENT_THRESHOLD
+        value: "0.15"
+      - key: BOT_MIN_SPREAD
+        value: "0.0002"
+      - key: BOT_MAX_CONCURRENT
+        value: "3"
+      - key: BOT_COOLDOWN_MIN
+        value: "30"
+      - key: BOT_TRADE_INTERVAL_MIN
+        value: "3"
     autoDeploy: true

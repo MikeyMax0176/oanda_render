@@ -7,14 +7,6 @@ set -euo pipefail
 # Logs / state dir
 mkdir -p runtime
 
-echo "[boot] starting GDELT news-sentiment worker in background..."
-# unbuffered stdout; write PID and log to runtime/
-python -u news_sentiment.py >> runtime/news.log 2>&1 & echo $! > runtime/news.pid
-
-# small sanity ping
-sleep 1
-ps -ef | grep -E 'news_sentiment.py' | grep -v grep || echo "[boot] WARN: worker not running"
-
 echo "[boot] starting streamlit dashboard..."
 exec streamlit run dashboard.py \
   --server.address 0.0.0.0 \

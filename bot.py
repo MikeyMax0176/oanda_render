@@ -17,6 +17,9 @@ ACC = os.environ["OANDA_ACCOUNT"]
 API = f"{HOST}/v3"
 H = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
+# Trading control
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+
 # Runtime files the dashboard reads
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", "/opt/render/project/src/runtime")
 HEARTBEAT_PATH = os.getenv("HEARTBEAT_PATH", f"{RUNTIME_DIR}/bot_heartbeat.json")
@@ -201,7 +204,7 @@ def record_last_trade_headline(headline: str, sentiment: float, side: str):
 
 # ========= Main loop =========
 def main():
-    print("[bot] starting…")
+    print(f"[bot] starting… DRY_RUN={'ENABLED (no orders will be placed)' if DRY_RUN else 'DISABLED (live trading)'}")
     last_trade_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     while True:
@@ -264,16 +267,20 @@ def main():
                 sl = entry - (SL_PIPS * PIP if side == "BUY" else -SL_PIPS * PIP)
                 units_signed = units if side == "BUY" else -units
 
-                print(f"[bot] placing {side} {INSTRUMENT} units={units_signed} @ {entry:.{DIGITS}f} "
+                print(f"[bot] {'DRY-RUN: would place' if DRY_RUN else 'placing'} {side} {INSTRUMENT} units={units_signed} @ {entry:.{DIGITS}f} "
                       f"TP={tp:.{DIGITS}f} SL={sl:.{DIGITS}f} headline='{headline[:80]}' sent={sentiment:+.2f}")
 
-                r = place_market(units_signed, tp, sl)
-                if r.status_code in (200, 201):
-                    print("[bot] order OK", r.status_code)
-                    last_trade_time = now_utc()
-                    record_last_trade_headline(headline, sentiment, side)
+                if DRY_RUN:
+                    print("[bot] DRY-RUN mode enabled - no actual order placed")
+                    record_last_trade_headline(headline, sentiment, f"{side} (DRY-RUN)")
                 else:
-                    print("[bot] order FAILED", r.status_code, r.text[:400])
+                    r = place_market(units_signed, tp, sl)
+                    if r.status_code in (200, 201):
+                        print("[bot] order OK", r.status_code)
+                        last_trade_time = now_utc()
+                        record_last_trade_headline(headline, sentiment, side)
+                    else:
+                        print("[bot] order FAILED", r.status_code, r.text[:400])
 
             # refresh heartbeat with live extras
             extra = {

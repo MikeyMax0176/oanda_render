@@ -1,2 +1,2 @@
 web: bash start.sh
-worker: python -u news_sentiment.py
+worker: python -u bot.py
