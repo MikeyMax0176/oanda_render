@@ -49,4 +49,12 @@ services:
         value: "30"
       - key: BOT_TRADE_INTERVAL_MIN
         value: "3"
+      - key: BOT_TP_PIPS
+        value: "38"
+      - key: BOT_SL_PIPS
+        value: "25"
+      - key: BOT_RISK_USD
+        value: "500"
+      - key: BOT_INSTRUMENT
+        value: "EUR_USD"
     autoDeploy: true
