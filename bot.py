@@ -36,7 +36,11 @@ MAX_CONCURRENT = int(os.getenv("BOT_MAX_CONCURRENT", "3"))
 MIN_SPREAD = float(os.getenv("BOT_MIN_SPREAD", "0.0002"))  # won’t trade if spread wider
 SENT_THRESHOLD = float(os.getenv("BOT_SENT_THRESHOLD", "0.15"))
 
-RSS_URL = os.getenv("BOT_RSS_URL", "https://feeds.reuters.com/reuters/businessNews")
+RSS_URLS = [
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    "https://feeds.reuters.com/reuters/businessNews",
+]
 
 # Pip sizes and price formatting
 PIP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}.get(INSTRUMENT, 0.0001)
@@ -139,9 +143,20 @@ def units_for_risk_usd(risk_usd: float, sl_pips: float, pip: float) -> int:
 
 # ========= News & sentiment =========
 def fetch_headlines(limit=8) -> list[str]:
-    feed = feedparser.parse(RSS_URL)
-    titles = [e.get("title", "").strip() for e in feed.entries[:limit]]
-    return [t for t in titles if t]
+    """Fetch headlines from multiple RSS feeds with fallback."""
+    for rss_url in RSS_URLS:
+        try:
+            feed = feedparser.parse(rss_url)
+            titles = [e.get("title", "").strip() for e in feed.entries[:limit]]
+            titles = [t for t in titles if t]
+            if len(titles) >= 3:  # Need at least 3 headlines
+                print(f"[bot] fetched {len(titles)} headlines from {rss_url.split('/')[2]}")
+                return titles
+        except Exception as e:
+            print(f"[bot] feed error {rss_url.split('/')[2]}: {e}")
+            continue
+    print("[bot] WARNING: all feeds failed, returning empty list")
+    return []
 
 
 def best_headline_with_sentiment(titles: list[str]) -> tuple[str, float] | None:
@@ -205,12 +220,15 @@ def record_last_trade_headline(headline: str, sentiment: float, side: str):
 # ========= Main loop =========
 def main():
     print(f"[bot] starting… DRY_RUN={'ENABLED (no orders will be placed)' if DRY_RUN else 'DISABLED (live trading)'}")
+    print(f"[bot] config: instrument={INSTRUMENT} tp={TP_PIPS} sl={SL_PIPS} threshold={SENT_THRESHOLD}")
     last_trade_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     while True:
         loop_started = now_utc()
+        print(f"[bot] loop starting at {loop_started.strftime('%H:%M:%S')}")
         try:
             # update heartbeat up-front so the light is green soon after start
+            print("[bot] writing heartbeat...")
             write_heartbeat()
 
             # guardrails
