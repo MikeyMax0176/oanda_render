@@ -40,7 +40,8 @@ REQUIRED_KEYWORDS = os.getenv(
 REQUIRED_KEYWORDS = [k.strip() for k in REQUIRED_KEYWORDS if k.strip()]
 
 # Strategy knobs (override with env vars if you wish)
-INSTRUMENT = os.getenv("BOT_INSTRUMENT", "EUR_USD")
+DEFAULT_INSTRUMENT = os.getenv("BOT_INSTRUMENT", "EUR_USD")
+INSTRUMENT = DEFAULT_INSTRUMENT  # Will be overridden dynamically based on headline
 TP_PIPS = float(os.getenv("BOT_TP_PIPS", "38"))         # take-profit distance
 SL_PIPS = float(os.getenv("BOT_SL_PIPS", "25"))         # stop-loss distance
 RISK_USD = float(os.getenv("BOT_RISK_USD", "500"))      # ~$ risk per trade at SL
@@ -50,15 +51,30 @@ MAX_CONCURRENT = int(os.getenv("BOT_MAX_CONCURRENT", "3"))
 MIN_SPREAD = float(os.getenv("BOT_MIN_SPREAD", "0.0002"))  # won’t trade if spread wider
 SENT_THRESHOLD = float(os.getenv("BOT_SENT_THRESHOLD", "0.15"))
 
-RSS_URLS = [
-    "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+# FX/Macro-focused RSS feeds (configurable via NEWS_FEEDS env var)
+DEFAULT_NEWS_FEEDS = [
     "https://feeds.reuters.com/reuters/businessNews",
+    "https://www.fxstreet.com/feeds/news",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.marketwatch.com/rss/realtimeheadlines",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # CNBC World Economy
 ]
+NEWS_FEEDS = os.getenv("NEWS_FEEDS", ",".join(DEFAULT_NEWS_FEEDS)).split(",")
+NEWS_FEEDS = [f.strip() for f in NEWS_FEEDS if f.strip()]
 
-# Pip sizes and price formatting
-PIP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}.get(INSTRUMENT, 0.0001)
-DIGITS = {"EUR_USD": 5, "GBP_USD": 5, "USD_JPY": 3, "XAU_USD": 2}.get(INSTRUMENT, 5)
+# Relevance scoring thresholds
+MIN_RELEVANCE_SCORE = int(os.getenv("MIN_RELEVANCE_SCORE", "4"))
+
+# Pip sizes and price formatting (dynamic based on instrument)
+PIP_MAP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}
+DIGITS_MAP = {"EUR_USD": 5, "GBP_USD": 5, "USD_JPY": 3, "XAU_USD": 2}
+
+def get_pip(instrument: str) -> float:
+    return PIP_MAP.get(instrument, 0.0001)
+
+def get_digits(instrument: str) -> int:
+    return DIGITS_MAP.get(instrument, 5)
 
 # Retry policy
 RETRY_STATUSES = {429, 500, 502, 503, 504}
@@ -121,8 +137,9 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def fmt_price(x: float) -> str:
-    return f"{x:.{DIGITS}f}"
+def fmt_price(x: float, instrument: str) -> str:
+    digits = get_digits(instrument)
+    return f"{x:.{digits}f}"
 
 
 def account_summary() -> dict:
@@ -155,25 +172,25 @@ def has_open_position(instrument: str) -> bool:
         return True  # Fail-safe: assume position exists if we can't check
 
 
-def pricing() -> tuple[float, float, float]:
-    """Return (bid, ask, spread)."""
-    j = get_json(f"/accounts/{ACC}/pricing", params={"instruments": INSTRUMENT})
+def pricing(instrument: str) -> tuple[float, float, float]:
+    """Return (bid, ask, spread) for given instrument."""
+    j = get_json(f"/accounts/{ACC}/pricing", params={"instruments": instrument})
     p = j["prices"][0]
     bid = float(p["bids"][0]["price"])
     ask = float(p["asks"][0]["price"])
     return bid, ask, ask - bid
 
 
-def place_market(units: int, tp: float, sl: float) -> requests.Response:
+def place_market(instrument: str, units: int, tp: float, sl: float) -> requests.Response:
     body = {
         "order": {
             "type": "MARKET",
-            "instrument": INSTRUMENT,
+            "instrument": instrument,
             "units": str(units),
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "takeProfitOnFill": {"price": fmt_price(tp), "timeInForce": "GTC"},
-            "stopLossOnFill": {"price": fmt_price(sl), "timeInForce": "GTC"},
+            "takeProfitOnFill": {"price": fmt_price(tp, instrument), "timeInForce": "GTC"},
+            "stopLossOnFill": {"price": fmt_price(sl, instrument), "timeInForce": "GTC"},
         }
     }
     return post_json(f"/accounts/{ACC}/orders", body)
@@ -235,67 +252,170 @@ def mark_headline_seen(headline_id: str, seen: set) -> set:
     return seen
 
 
-# ========= News & sentiment =========
-def fetch_headlines(limit=8) -> list[dict]:
-    """Fetch headlines from multiple RSS feeds with fallback.
-    Returns list of dicts with keys: title, source, guid, link
+# ========= FX Relevance Scoring =========
+def calculate_fx_relevance_score(title: str) -> int:
+    """Calculate FX relevance score for a headline.
+    Higher score = more relevant to FX/macro trading.
     """
-    for rss_url in RSS_URLS:
+    title_upper = title.upper()
+    score = 0
+    
+    # Central banks (+3)
+    central_banks = ["ECB", "FED", "FEDERAL RESERVE", "BOE", "BOJ", "SNB", "RBA", "RBNZ", "PBOC"]
+    if any(cb in title_upper for cb in central_banks):
+        score += 3
+    
+    # Key economic indicators and monetary policy (+3)
+    monetary_terms = ["CPI", "INFLATION", "RATE", "HIKE", "CUT", "YIELD", "BOND", "TREASURY", "MONETARY"]
+    if any(term in title_upper for term in monetary_terms):
+        score += 3
+    
+    # Economic data (+2)
+    economic_data = ["GDP", "PMI", "NFP", "JOB", "UNEMPLOYMENT", "RETAIL SALES", "PAYROLL", "MANUFACTURING"]
+    if any(term in title_upper for term in economic_data):
+        score += 2
+    
+    # Currency mentions (+2)
+    currencies = ["EUR", "USD", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "DOLLAR", "EURO", "POUND", "YEN"]
+    currency_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD", "USD/CAD"]
+    if any(curr in title_upper for curr in currencies + currency_pairs):
+        score += 2
+    
+    # Negative filters (-5 each)
+    non_market_terms = [
+        "COIN", "ROYAL", "CELEBRITY", "SPORT", "MURDER", "MUSEUM", "ART", "CAT", "DOG",
+        "SAVED FOR THE NATION", "900 YEARS", "WEDDING", "DIVORCE", "ACTOR", "ACTRESS",
+        "FILM", "MOVIE", "MUSIC", "SINGER", "FOOTBALL", "SOCCER", "BASKETBALL", "CRICKET"
+    ]
+    for term in non_market_terms:
+        if term in title_upper:
+            score -= 5
+    
+    return score
+
+
+def detect_instrument_from_headline(title: str, default: str = "EUR_USD") -> str:
+    """Detect trading instrument from headline content.
+    Returns appropriate instrument based on currency/central bank mentions.
+    """
+    title_upper = title.upper()
+    
+    # Check for specific currency pairs first
+    if "GBP/USD" in title_upper or "CABLE" in title_upper:
+        return "GBP_USD"
+    if "EUR/USD" in title_upper:
+        return "EUR_USD"
+    if "USD/JPY" in title_upper:
+        return "USD_JPY"
+    
+    # Check for currency/central bank mentions
+    if "GBP" in title_upper or "BOE" in title_upper or "BANK OF ENGLAND" in title_upper or "POUND" in title_upper:
+        return "GBP_USD"
+    if "EUR" in title_upper or "ECB" in title_upper or "EUROPEAN CENTRAL BANK" in title_upper or "EURO" in title_upper:
+        return "EUR_USD"
+    if "JPY" in title_upper or "BOJ" in title_upper or "BANK OF JAPAN" in title_upper or "YEN" in title_upper:
+        return "USD_JPY"
+    
+    # Default to EUR_USD for general USD/Fed news
+    if "USD" in title_upper or "FED" in title_upper or "FEDERAL RESERVE" in title_upper or "DOLLAR" in title_upper:
+        return default
+    
+    return default
+
+
+# ========= News & sentiment =========
+def fetch_headlines(limit=15) -> list[dict]:
+    """Fetch headlines from multiple RSS feeds with fallback.
+    Returns list of dicts with keys: title, source, guid, link, score, instrument
+    """
+    all_entries = []
+    
+    for rss_url in NEWS_FEEDS:
         try:
             feed = feedparser.parse(rss_url)
             source = rss_url.split('/')[2]  # Extract domain
-            entries = []
+            
             for e in feed.entries[:limit]:
                 title = e.get("title", "").strip()
                 if not title:
                     continue
-                entries.append({
+                
+                # Calculate relevance score
+                score = calculate_fx_relevance_score(title)
+                
+                # Skip if below minimum threshold
+                if score < MIN_RELEVANCE_SCORE:
+                    continue
+                
+                # Detect appropriate instrument
+                instrument = detect_instrument_from_headline(title, DEFAULT_INSTRUMENT)
+                
+                all_entries.append({
                     "title": title,
                     "source": source,
                     "guid": e.get("id", e.get("link", "")),
-                    "link": e.get("link", "")
+                    "link": e.get("link", ""),
+                    "score": score,
+                    "instrument": instrument
                 })
-            if len(entries) >= 3:  # Need at least 3 headlines
-                print(f"[bot] fetched {len(entries)} headlines from {source}")
-                return entries
+            
+            if len(all_entries) > 0:
+                print(f"[bot] fetched {len([e for e in all_entries if e['source'] == source])} relevant headlines from {source}")
+        
         except Exception as e:
-            print(f"[bot] feed error {rss_url.split('/')[2]}: {e}")
+            print(f"[bot] feed error {rss_url.split('/')[2] if '/' in rss_url else rss_url}: {e}")
             continue
-    print("[bot] WARNING: all feeds failed, returning empty list")
-    return []
-
-
-def is_headline_relevant(title: str) -> bool:
-    """Check if headline contains at least one required keyword."""
-    if not REQUIRED_KEYWORDS:
-        return True  # No filtering if no keywords configured
-    title_upper = title.upper()
-    for keyword in REQUIRED_KEYWORDS:
-        if keyword in title_upper:
-            return True
-    return False
-
-
-def best_headline_with_sentiment(entries: list[dict]) -> tuple[dict, float] | None:
-    """Find the entry with the strongest sentiment that passes relevance filter.
-    Returns (entry_dict, sentiment) or None.
-    """
-    best = None
-    best_abs = 0.0
     
+    # Sort by score (highest first)
+    all_entries.sort(key=lambda x: x['score'], reverse=True)
+    
+    if len(all_entries) == 0:
+        print("[bot] WARNING: no relevant headlines found across all feeds")
+    else:
+        print(f"[bot] total relevant headlines: {len(all_entries)}")
+    
+    return all_entries
+
+
+def best_headline_with_sentiment(entries: list[dict], seen_headlines: set) -> tuple[dict, float, list[dict]] | None:
+    """Find the highest-scoring entry with strong sentiment that hasn't been traded.
+    Returns (entry_dict, sentiment, top_5_candidates) or None.
+    """
+    candidates = []
+    
+    # Evaluate all entries
     for entry in entries:
         title = entry["title"]
+        headline_id = compute_headline_id(entry["source"], entry["guid"], entry["title"])
         
-        # Check relevance first
-        if not is_headline_relevant(title):
+        # Skip if already traded
+        if is_headline_seen(headline_id, seen_headlines):
             continue
         
-        s = analyzer.polarity_scores(title)["compound"]
-        if abs(s) > best_abs:
-            best_abs = abs(s)
-            best = (entry, s)
+        # Calculate sentiment
+        sentiment = analyzer.polarity_scores(title)["compound"]
+        
+        # Only consider if sentiment is strong enough
+        if abs(sentiment) >= SENT_THRESHOLD:
+            candidates.append({
+                "entry": entry,
+                "sentiment": sentiment,
+                "headline_id": headline_id,
+                "combined_score": entry["score"] + abs(sentiment) * 10  # Weight sentiment heavily
+            })
     
-    return best
+    if not candidates:
+        return None
+    
+    # Sort by combined score (relevance + sentiment)
+    candidates.sort(key=lambda x: x["combined_score"], reverse=True)
+    
+    # Get top 5 for logging
+    top_5 = candidates[:5]
+    
+    # Return the best one
+    best = candidates[0]
+    return (best["entry"], best["sentiment"], top_5)
 
 
 # ========= Files the dashboard reads =========
@@ -316,7 +436,7 @@ def write_heartbeat(extra: dict | None = None):
     hb = {
         "last_beat": now_utc().isoformat(),
         "account": acc_alias,
-        "instrument": INSTRUMENT,
+        "default_instrument": DEFAULT_INSTRUMENT,
         "risk_pct": float(os.getenv("BOT_RISK_PCT", "0")),  # optional display
         "risk_usd": RISK_USD,
         "sl_pips": SL_PIPS,
@@ -327,6 +447,7 @@ def write_heartbeat(extra: dict | None = None):
         "sentiment_threshold": SENT_THRESHOLD,
         "max_concurrent_trades": MAX_CONCURRENT,
         "max_daily_loss": float(os.getenv("BOT_MAX_DAILY_LOSS", "1500")),
+        "min_relevance_score": MIN_RELEVANCE_SCORE,
     }
     if extra:
         hb.update(extra)
@@ -348,8 +469,9 @@ def record_last_trade_headline(headline: str, sentiment: float, side: str, sourc
 # ========= Main loop =========
 def main():
     print(f"[bot] starting… DRY_RUN={'ENABLED (no orders will be placed)' if DRY_RUN else 'DISABLED (live trading)'}")
-    print(f"[bot] config: instrument={INSTRUMENT} tp={TP_PIPS} sl={SL_PIPS} threshold={SENT_THRESHOLD}")
-    print(f"[bot] safety: headline_dedupe={SEEN_HEADLINES_PATH}, keywords={','.join(REQUIRED_KEYWORDS[:5])}...")
+    print(f"[bot] config: default_instrument={DEFAULT_INSTRUMENT} tp={TP_PIPS} sl={SL_PIPS} threshold={SENT_THRESHOLD}")
+    print(f"[bot] safety: headline_dedupe={SEEN_HEADLINES_PATH}, min_relevance_score={MIN_RELEVANCE_SCORE}")
+    print(f"[bot] feeds: {len(NEWS_FEEDS)} RSS sources configured")
     last_trade_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
     
     # Load seen headlines at startup
@@ -374,20 +496,23 @@ def main():
             if len(trades) >= MAX_CONCURRENT:
                 print(f"[bot] max concurrent trades reached: {len(trades)} ≥ {MAX_CONCURRENT}")
 
-            # fetch pricing/spread
-            try:
-                bid, ask, spread = pricing()
-            except Exception as e:
-                print(f"[bot] pricing error: {e}")
-                bid, ask, spread = None, None, None
-
             # news sentiment
             chosen = None
+            top_candidates = []
             try:
-                entries = fetch_headlines(limit=10)
-                chosen = best_headline_with_sentiment(entries)
-                if chosen is None and entries:
-                    print(f"[bot] no relevant headlines found (checked {len(entries)} entries, keywords: {','.join(REQUIRED_KEYWORDS[:3])}...)")
+                entries = fetch_headlines(limit=15)
+                result = best_headline_with_sentiment(entries, seen_headlines)
+                if result:
+                    chosen_entry, sentiment, top_candidates = result
+                    chosen = (chosen_entry, sentiment)
+                    
+                    # Log top 5 candidates
+                    print(f"[bot] Top 5 candidates:")
+                    for i, cand in enumerate(top_candidates, 1):
+                        e = cand["entry"]
+                        print(f"  {i}. [score={e['score']}, sent={cand['sentiment']:+.2f}, {e['instrument']}] {e['title'][:70]}...")
+                elif entries:
+                    print(f"[bot] no tradeable headlines (checked {len(entries)} entries, all filtered or already traded)")
             except Exception as e:
                 print(f"[bot] news error: {e}")
 
@@ -398,43 +523,55 @@ def main():
             headline = ""
             headline_id = None
             source = ""
+            instrument = DEFAULT_INSTRUMENT
+            relevance_score = 0
+            bid, ask, spread = None, None, None
 
-            if chosen and spread is not None and len(trades) < MAX_CONCURRENT:
+            if chosen and len(trades) < MAX_CONCURRENT:
                 entry, sentiment = chosen
                 headline = entry["title"]
                 source = entry["source"]
+                instrument = entry["instrument"]
+                relevance_score = entry["score"]
                 headline_id = compute_headline_id(entry["source"], entry["guid"], entry["title"])
                 
-                # Check if we've already traded this headline
+                # Fetch pricing for the detected instrument
+                try:
+                    bid, ask, spread = pricing(instrument)
+                except Exception as e:
+                    print(f"[bot] pricing error for {instrument}: {e}")
+                    bid, ask, spread = None, None, None
+                
+                # Check if we've already traded this headline (redundant check)
                 if is_headline_seen(headline_id, seen_headlines):
                     print(f"[bot] already traded headline_id={headline_id[:16]}... ('{headline[:60]}')")
-                elif abs(sentiment) >= SENT_THRESHOLD:
-                    if spread <= MIN_SPREAD:
-                        # cooldown check
-                        minutes_since_trade = (now_utc() - last_trade_time).total_seconds() / 60.0
-                        if minutes_since_trade >= COOLDOWN_MIN:
-                            # Position gating: check if we already have an open position
-                            if has_open_position(INSTRUMENT):
-                                print(f"[bot] position already open for {INSTRUMENT}, skipping entry")
-                            else:
-                                side = "BUY" if sentiment > 0 else "SELL"
-                                should_trade = True
+                elif spread is not None and spread <= MIN_SPREAD:
+                    # cooldown check
+                    minutes_since_trade = (now_utc() - last_trade_time).total_seconds() / 60.0
+                    if minutes_since_trade >= COOLDOWN_MIN:
+                        # Position gating: check if we already have an open position
+                        if has_open_position(instrument):
+                            print(f"[bot] position already open for {instrument}, skipping entry")
                         else:
-                            print(f"[bot] cooldown active: minutes_since_last_trade={minutes_since_trade:.1f} < COOLDOWN_MIN={COOLDOWN_MIN}")
+                            side = "BUY" if sentiment > 0 else "SELL"
+                            should_trade = True
                     else:
-                        print(f"[bot] spread too wide: {spread:.5f} > {MIN_SPREAD:.5f}")
-                else:
-                    print(f"[bot] sentiment below threshold: {sentiment:+.2f} (th={SENT_THRESHOLD:+.2f})")
+                        print(f"[bot] cooldown active: minutes_since_last_trade={minutes_since_trade:.1f} < COOLDOWN_MIN={COOLDOWN_MIN}")
+                elif spread is not None:
+                    print(f"[bot] spread too wide: {spread:.5f} > {MIN_SPREAD:.5f}")
 
             if should_trade and bid is not None and ask is not None and headline_id is not None:
                 entry_price = ask if side == "BUY" else bid
-                units = units_for_risk_usd(RISK_USD, SL_PIPS, PIP)
-                tp = entry_price + (TP_PIPS * PIP if side == "BUY" else -TP_PIPS * PIP)
-                sl = entry_price - (SL_PIPS * PIP if side == "BUY" else -SL_PIPS * PIP)
+                pip = get_pip(instrument)
+                digits = get_digits(instrument)
+                units = units_for_risk_usd(RISK_USD, SL_PIPS, pip)
+                tp = entry_price + (TP_PIPS * pip if side == "BUY" else -TP_PIPS * pip)
+                sl = entry_price - (SL_PIPS * pip if side == "BUY" else -SL_PIPS * pip)
                 units_signed = units if side == "BUY" else -units
 
-                print(f"[bot] {'DRY-RUN: would place' if DRY_RUN else 'placing'} {side} {INSTRUMENT} units={units_signed} @ {entry_price:.{DIGITS}f} "
-                      f"TP={tp:.{DIGITS}f} SL={sl:.{DIGITS}f} headline='{headline[:80]}' sent={sentiment:+.2f}")
+                print(f"[bot] {'DRY-RUN: would place' if DRY_RUN else 'placing'} {side} {instrument} units={units_signed} @ {entry_price:.{digits}f} "
+                      f"TP={tp:.{digits}f} SL={sl:.{digits}f} score={relevance_score} sent={sentiment:+.2f}")
+                print(f"[bot]   headline: '{headline[:100]}{'...' if len(headline) > 100 else ''}' [{source}]")
 
                 if DRY_RUN:
                     print("[bot] DRY-RUN mode enabled - no actual order placed")
@@ -443,7 +580,7 @@ def main():
                     seen_headlines = mark_headline_seen(headline_id, seen_headlines)
                     save_seen_headlines(seen_headlines)
                 else:
-                    r = place_market(units_signed, tp, sl)
+                    r = place_market(instrument, units_signed, tp, sl)
                     if r.status_code in (200, 201):
                         print(f"[bot] order OK {r.status_code}")
                         last_trade_time = now_utc()
@@ -459,6 +596,8 @@ def main():
             extra = {
                 "last_headline": headline,
                 "last_sentiment": sentiment,
+                "last_instrument": instrument,
+                "last_relevance_score": relevance_score,
                 "spread": spread,
                 "open_trades": len(trades),
                 "last_side": side,
