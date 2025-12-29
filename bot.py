@@ -275,6 +275,11 @@ def calculate_fx_relevance_score(title: str) -> int:
     if any(term in title_upper for term in economic_data):
         score += 2
     
+    # High-impact data releases (+1 bonus)
+    high_impact = ["NFP", "NON-FARM", "PAYROLL", "FOMC", "CPI", "INFLATION"]
+    if any(term in title_upper for term in high_impact):
+        score += 1
+    
     # Currency mentions (+2)
     currencies = ["EUR", "USD", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "DOLLAR", "EURO", "POUND", "YEN"]
     currency_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD", "USD/CAD"]
