@@ -6,6 +6,8 @@ import math
 import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import email.utils
 
 import requests
 import feedparser
@@ -19,17 +21,17 @@ ACC = os.environ["OANDA_ACCOUNT"]
 API = f"{HOST}/v3"
 H = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-# Trading control
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+# Trading control - SAFETY: Default to DRY_RUN=1 (safe mode)
+# Only enable live trading by explicitly setting DRY_RUN=0
+DRY_RUN = os.getenv("DRY_RUN", "1") != "0"
 
 # Runtime files the dashboard reads
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", "/opt/render/project/src/runtime")
 HEARTBEAT_PATH = os.getenv("HEARTBEAT_PATH", f"{RUNTIME_DIR}/bot_heartbeat.json")
 NEWS_LAST_TRADE_PATH = os.getenv("NEWS_LAST_TRADE_PATH", f"{RUNTIME_DIR}/news_last_trade.json")
 
-# Data directory for persistent stores (fallback to /tmp if not writable)
-DATA_DIR = os.getenv("DATA_DIR", "/opt/render/project/src/data")
-SEEN_HEADLINES_PATH = os.path.join(DATA_DIR, "seen_headlines.json")
+# Persistent dedupe storage on Render disk
+SEEN_HEADLINES_PATH = os.getenv("SEEN_HEADLINES_PATH", "/var/data/seen_headlines.json")
 MAX_SEEN_HEADLINES = 500
 
 # Relevance filtering
@@ -52,19 +54,23 @@ MIN_SPREAD = float(os.getenv("BOT_MIN_SPREAD", "0.0002"))  # won’t trade if sp
 SENT_THRESHOLD = float(os.getenv("BOT_SENT_THRESHOLD", "0.15"))
 
 # FX/Macro-focused RSS feeds (configurable via NEWS_FEEDS env var)
+# Using only stable RSS endpoints - no HTML scraping
 DEFAULT_NEWS_FEEDS = [
     "https://feeds.reuters.com/reuters/businessNews",
     "https://www.fxstreet.com/feeds/news",
     "https://www.investing.com/rss/news.rss",
     "https://www.marketwatch.com/rss/realtimeheadlines",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
-    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # CNBC World Economy
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # CNBC World Economy RSS
 ]
 NEWS_FEEDS = os.getenv("NEWS_FEEDS", ",".join(DEFAULT_NEWS_FEEDS)).split(",")
 NEWS_FEEDS = [f.strip() for f in NEWS_FEEDS if f.strip()]
 
 # Relevance scoring thresholds
 MIN_RELEVANCE_SCORE = int(os.getenv("MIN_RELEVANCE_SCORE", "4"))
+
+# News debugging and age filtering
+NEWS_DEBUG = int(os.getenv("NEWS_DEBUG", "0"))
+MAX_HEADLINE_AGE_HOURS = int(os.getenv("MAX_HEADLINE_AGE_HOURS", "24"))
 
 # Pip sizes and price formatting (dynamic based on instrument)
 PIP_MAP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}
@@ -83,18 +89,21 @@ analyzer = SentimentIntensityAnalyzer()
 
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 
-# Ensure data directory exists with fallback to /tmp
+# Ensure dedupe directory exists (mkdir -p equivalent) with fallback to /tmp
 try:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    # Get directory from SEEN_HEADLINES_PATH and create it (mkdir -p)
+    seen_dir = os.path.dirname(SEEN_HEADLINES_PATH)
+    if seen_dir:  # Only create if path has a directory component
+        os.makedirs(seen_dir, exist_ok=True)
     # Test write access
-    test_file = os.path.join(DATA_DIR, ".write_test")
+    test_file = os.path.join(seen_dir if seen_dir else ".", ".write_test")
     with open(test_file, "w") as f:
         f.write("test")
     os.remove(test_file)
 except (OSError, PermissionError) as e:
-    print(f"[bot] WARNING: {DATA_DIR} not writable ({e}), falling back to /tmp")
-    DATA_DIR = "/tmp"
-    SEEN_HEADLINES_PATH = os.path.join(DATA_DIR, "seen_headlines.json")
+    print(f"[bot] WARNING: {SEEN_HEADLINES_PATH} directory not writable ({e}), falling back to /tmp")
+    SEEN_HEADLINES_PATH = "/tmp/seen_headlines.json"
+    os.makedirs("/tmp", exist_ok=True)  # Ensure /tmp exists
 
 
 # ========= HTTP helpers with backoff =========
@@ -207,6 +216,42 @@ def units_for_risk_usd(risk_usd: float, sl_pips: float, pip: float) -> int:
     return max(1000, int(round(u / 10.0) * 10))
 
 
+# ========= URL canonicalization =========
+def canonicalize_url(url: str) -> str:
+    """Strip tracking parameters and fragments from URL for deduplication.
+    Removes common tracking parameters like utm_*, fbclid, gclid, etc.
+    """
+    if not url:
+        return ""
+    
+    try:
+        parsed = urlparse(url)
+        
+        # Parse query parameters
+        params = parse_qs(parsed.query)
+        
+        # Remove common tracking parameters
+        tracking_params = {
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+            'fbclid', 'gclid', 'msclkid', '_ga', 'mc_cid', 'mc_eid',
+            'ref', 'source', 'campaign'
+        }
+        
+        # Keep only non-tracking parameters
+        cleaned_params = {k: v for k, v in params.items() if k.lower() not in tracking_params}
+        
+        # Rebuild query string
+        new_query = urlencode(cleaned_params, doseq=True) if cleaned_params else ''
+        
+        # Rebuild URL without fragment and with cleaned query
+        canonical = urlunparse((parsed.scheme, parsed.netloc, parsed.path, 
+                               parsed.params, new_query, ''))
+        
+        return canonical.lower()  # Normalize to lowercase for consistent comparison
+    except Exception:
+        return url.lower()
+
+
 # ========= Headline deduplication =========
 def compute_headline_id(source: str, guid: str, title: str) -> str:
     """Compute a unique ID for a headline using SHA256."""
@@ -215,14 +260,19 @@ def compute_headline_id(source: str, guid: str, title: str) -> str:
 
 
 def load_seen_headlines() -> set:
-    """Load the set of seen headline IDs from disk."""
+    """Load the set of seen headline IDs from disk. Handles missing/corrupt files gracefully."""
     try:
         if os.path.exists(SEEN_HEADLINES_PATH):
             with open(SEEN_HEADLINES_PATH, 'r') as f:
                 data = json.load(f)
-                return set(data.get("headline_ids", []))
+                seen = set(data.get("headline_ids", []))
+                print(f"[bot] dedupe path={SEEN_HEADLINES_PATH}, loaded {len(seen)} seen headlines")
+                return seen
+        else:
+            print(f"[bot] dedupe path={SEEN_HEADLINES_PATH}, loaded 0 seen headlines (file does not exist)")
     except Exception as e:
-        print(f"[bot] WARNING: failed to load seen headlines: {e}")
+        print(f"[bot] WARNING: failed to load seen headlines from {SEEN_HEADLINES_PATH}: {e}")
+        print(f"[bot] starting with empty dedupe set")
     return set()
 
 
@@ -331,41 +381,167 @@ def detect_instrument_from_headline(title: str, default: str = "EUR_USD") -> str
 # ========= News & sentiment =========
 def fetch_headlines(limit=15) -> list[dict]:
     """Fetch headlines from multiple RSS feeds with fallback.
-    Returns list of dicts with keys: title, source, guid, link, score, instrument
+    Returns list of dicts with keys: title, source, guid, link, score, instrument, published_utc
+    Includes DEBUG logging and age filtering.
+    
+    STRICT REQUIREMENTS:
+    - Every item MUST have a parseable publish timestamp
+    - Items without timestamps are DISCARDED
+    - Items older than MAX_HEADLINE_AGE_HOURS are DISCARDED
     """
     all_entries = []
+    seen_canonical_urls = set()  # For cross-source deduplication
+    now = now_utc()
+    
+    # Track discard reasons for summary
+    discard_stats = {
+        'total_parsed': 0,
+        'no_timestamp': 0,
+        'parse_failed': 0,
+        'too_old': 0,
+        'low_relevance': 0,
+        'duplicate_url': 0,
+        'accepted': 0
+    }
+    
+    if NEWS_DEBUG:
+        print(f"[bot][DEBUG] NEWS_DEBUG={NEWS_DEBUG}, MAX_HEADLINE_AGE_HOURS={MAX_HEADLINE_AGE_HOURS}")
     
     for rss_url in NEWS_FEEDS:
         try:
-            feed = feedparser.parse(rss_url)
+            # Fetch the feed with explicit request to capture status
+            if NEWS_DEBUG:
+                print(f"[bot][DEBUG] Fetching: {rss_url}")
+            
+            response = requests.get(rss_url, timeout=10)
+            status_code = response.status_code
+            content_length = len(response.content)
+            
+            if NEWS_DEBUG:
+                print(f"[bot][DEBUG]   HTTP Status: {status_code}")
+                print(f"[bot][DEBUG]   Response Size: {content_length} bytes")
+            
+            # Parse with feedparser
+            feed = feedparser.parse(response.content)
             source = rss_url.split('/')[2]  # Extract domain
+            
+            parsed_count = len(feed.entries[:limit])
+            if NEWS_DEBUG:
+                print(f"[bot][DEBUG]   Parsed Headlines: {parsed_count}")
+            
+            # Track items for this source
+            source_relevant = 0
+            source_items = []
             
             for e in feed.entries[:limit]:
                 title = e.get("title", "").strip()
                 if not title:
                     continue
                 
+                discard_stats['total_parsed'] += 1
+                
+                link = e.get("link", "")
+                guid = e.get("id", link)
+                
+                # Parse published time
+                published_utc = None
+                pub_date_str = None
+                
+                # Try multiple date fields
+                for date_field in ['published', 'pubDate', 'updated', 'created']:
+                    if date_field in e:
+                        pub_date_str = e[date_field]
+                        break
+                
+                # Parse the date
+                if pub_date_str:
+                    try:
+                        # feedparser often provides published_parsed
+                        if hasattr(e, 'published_parsed') and e.published_parsed:
+                            published_utc = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+                        elif hasattr(e, 'updated_parsed') and e.updated_parsed:
+                            published_utc = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
+                        else:
+                            # Try parsing with email.utils for RFC 2822 format
+                            parsed_time = email.utils.parsedate_to_datetime(pub_date_str)
+                            if parsed_time:
+                                # Convert to UTC if it has timezone info
+                                if parsed_time.tzinfo is None:
+                                    published_utc = parsed_time.replace(tzinfo=timezone.utc)
+                                else:
+                                    published_utc = parsed_time.astimezone(timezone.utc)
+                    except Exception as parse_err:
+                        discard_stats['parse_failed'] += 1
+                        if NEWS_DEBUG:
+                            print(f"[bot][DEBUG]   DISCARDED (parse failed): {title[:50]}... | error: {parse_err}")
+                        continue
+                
+                # STRICT: Discard if no published time
+                if not published_utc:
+                    discard_stats['no_timestamp'] += 1
+                    if NEWS_DEBUG:
+                        print(f"[bot][DEBUG]   DISCARDED (no timestamp): {title[:50]}...")
+                    continue
+                
+                # Check age - STRICT age gate
+                age_hours = (now - published_utc).total_seconds() / 3600
+                if age_hours > MAX_HEADLINE_AGE_HOURS:
+                    discard_stats['too_old'] += 1
+                    if NEWS_DEBUG:
+                        print(f"[bot][DEBUG]   DISCARDED (age={age_hours:.1f}h > {MAX_HEADLINE_AGE_HOURS}h): {title[:50]}...")
+                    continue
+                
+                # Store for DEBUG printing (first 10 per source)
+                if NEWS_DEBUG and len(source_items) < 10:
+                    source_items.append({
+                        'published_utc': published_utc,
+                        'title': title,
+                        'link': link
+                    })
+                
                 # Calculate relevance score
                 score = calculate_fx_relevance_score(title)
                 
                 # Skip if below minimum threshold
                 if score < MIN_RELEVANCE_SCORE:
+                    discard_stats['low_relevance'] += 1
                     continue
+                
+                # Deduplicate by canonical URL
+                canonical_url = canonicalize_url(link)
+                if canonical_url in seen_canonical_urls:
+                    discard_stats['duplicate_url'] += 1
+                    if NEWS_DEBUG:
+                        print(f"[bot][DEBUG]   DISCARDED (duplicate URL): {title[:50]}...")
+                    continue
+                seen_canonical_urls.add(canonical_url)
                 
                 # Detect appropriate instrument
                 instrument = detect_instrument_from_headline(title, DEFAULT_INSTRUMENT)
                 
+                # ACCEPTED - this item passed all gates
+                discard_stats['accepted'] += 1
+                
                 all_entries.append({
                     "title": title,
                     "source": source,
-                    "guid": e.get("id", e.get("link", "")),
-                    "link": e.get("link", ""),
+                    "guid": guid,
+                    "link": link,
+                    "published_utc": published_utc,
+                    "age_hours": age_hours,
                     "score": score,
                     "instrument": instrument
                 })
+                source_relevant += 1
             
-            if len(all_entries) > 0:
-                print(f"[bot] fetched {len([e for e in all_entries if e['source'] == source])} relevant headlines from {source}")
+            # DEBUG: Print first 10 parsed items
+            if NEWS_DEBUG and source_items:
+                print(f"[bot][DEBUG] First {len(source_items)} parsed items from {source}:")
+                for item in source_items:
+                    timestamp = item['published_utc'].strftime('%Y-%m-%d %H:%M:%S UTC')
+                    print(f"[bot][DEBUG]   {timestamp} | {item['title'][:60]}... | {item['link'][:80]}")
+            
+            print(f"[bot] fetched {source_relevant} relevant headlines from {source} (status={status_code}, size={content_length}B, parsed={parsed_count})")
         
         except Exception as e:
             print(f"[bot] feed error {rss_url.split('/')[2] if '/' in rss_url else rss_url}: {e}")
@@ -374,10 +550,28 @@ def fetch_headlines(limit=15) -> list[dict]:
     # Sort by score (highest first)
     all_entries.sort(key=lambda x: x['score'], reverse=True)
     
-    if len(all_entries) == 0:
-        print("[bot] WARNING: no relevant headlines found across all feeds")
-    else:
-        print(f"[bot] total relevant headlines: {len(all_entries)}")
+    # Log summary with discard statistics
+    print(f"[bot] total relevant headlines: {len(all_entries)}")
+    
+    if len(all_entries) == 0 and discard_stats['total_parsed'] > 0:
+        print(f"[bot] WARNING: All {discard_stats['total_parsed']} items discarded - breakdown:")
+        print(f"[bot]   - no_timestamp: {discard_stats['no_timestamp']}")
+        print(f"[bot]   - parse_failed: {discard_stats['parse_failed']}")
+        print(f"[bot]   - too_old (>{MAX_HEADLINE_AGE_HOURS}h): {discard_stats['too_old']}")
+        print(f"[bot]   - low_relevance (<{MIN_RELEVANCE_SCORE}): {discard_stats['low_relevance']}")
+        print(f"[bot]   - duplicate_url: {discard_stats['duplicate_url']}")
+    elif len(all_entries) > 0:
+        # Show age range of accepted candidates
+        ages = [e['age_hours'] for e in all_entries]
+        print(f"[bot] age range: {min(ages):.1f}h - {max(ages):.1f}h (max allowed: {MAX_HEADLINE_AGE_HOURS}h)")
+        
+        # Log first few candidates with their details
+        if NEWS_DEBUG:
+            print(f"[bot][DEBUG] Top {min(5, len(all_entries))} candidates:")
+            for i, e in enumerate(all_entries[:5], 1):
+                pub_str = e['published_utc'].strftime('%Y-%m-%d %H:%M UTC')
+                print(f"[bot][DEBUG]   {i}. age={e['age_hours']:.1f}h, pub={pub_str}, score={e['score']}")
+                print(f"[bot][DEBUG]      {e['title'][:80]}...")
     
     return all_entries
 
@@ -417,6 +611,14 @@ def best_headline_with_sentiment(entries: list[dict], seen_headlines: set) -> tu
     
     # Get top 5 for logging
     top_5 = candidates[:5]
+    
+    # DEBUG: Print final filtered candidates
+    if NEWS_DEBUG:
+        print(f"[bot][DEBUG] Final {len(candidates)} candidates after sentiment filtering:")
+        for i, cand in enumerate(candidates[:10], 1):  # Show top 10
+            e = cand["entry"]
+            timestamp = e['published_utc'].strftime('%Y-%m-%d %H:%M:%S UTC') if 'published_utc' in e else 'N/A'
+            print(f"[bot][DEBUG]   {i}. {timestamp} | {e['title'][:60]}... | {e['link'][:80]}")
     
     # Return the best one
     best = candidates[0]
