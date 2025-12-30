@@ -44,10 +44,13 @@ RUNTIME_DIR = os.getenv("RUNTIME_DIR", "/opt/render/project/src/runtime")
 SENTIMENT_DATA_PATH = os.getenv("SENTIMENT_DATA_PATH", f"{RUNTIME_DIR}/sentiment_data.json")
 
 # Multiple RSS feeds - try in order until we get enough headlines
+# Note: Reuters feeds.reuters.com disabled due to DNS failures
+# Note: FXStreet /rss/news disabled due to 404 errors
 RSS_FEEDS = [
-    "https://feeds.reuters.com/reuters/businessNews",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    # "https://www.fxstreet.com/rss/news",  # DISABLED: Returns 404
+    # "https://feeds.reuters.com/reuters/businessNews",  # DISABLED: DNS fails
 ]
 
 POLL_INTERVAL_SEC = int(os.getenv("SENTIMENT_POLL_INTERVAL", "300"))  # 5 minutes default

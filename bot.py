@@ -53,24 +53,47 @@ MAX_CONCURRENT = int(os.getenv("BOT_MAX_CONCURRENT", "3"))
 MIN_SPREAD = float(os.getenv("BOT_MIN_SPREAD", "0.0002"))  # won’t trade if spread wider
 SENT_THRESHOLD = float(os.getenv("BOT_SENT_THRESHOLD", "0.15"))
 
-# FX/Macro-focused RSS feeds (configurable via NEWS_FEEDS env var)
+# FX/Macro-focused RSS feeds - source-aware configuration
+# Each feed has individual max_age_hours and min_relevance thresholds
 # Using only stable RSS endpoints - no HTML scraping
+# Note: Reuters feeds.reuters.com removed due to DNS failures
 DEFAULT_NEWS_FEEDS = [
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://www.fxstreet.com/feeds/news",
-    "https://www.investing.com/rss/news.rss",
-    "https://www.marketwatch.com/rss/realtimeheadlines",
-    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # CNBC World Economy RSS
+    {"url": "https://www.investing.com/rss/news.rss", "max_age_hours": 48, "min_relevance": 3},
+    {"url": "https://www.marketwatch.com/rss/realtimeheadlines", "max_age_hours": 24, "min_relevance": 3},
+    {"url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", "max_age_hours": 48, "min_relevance": 3},
+    {"url": "https://feeds.a.dj.net/rss/RSSMarketsMain.xml", "max_age_hours": 48, "min_relevance": 4},  # WSJ - high quality
+    {"url": "https://www.forexlive.com/feed/news", "max_age_hours": 24, "min_relevance": 2},  # ForexLive - FX specialist
+    # {"url": "https://www.fxstreet.com/rss/news", "max_age_hours": 72, "min_relevance": 2},  # DISABLED: Returns 404
+    # {"url": "https://feeds.reuters.com/reuters/businessNews", "max_age_hours": 48, "min_relevance": 3},  # DISABLED: DNS fails
 ]
-NEWS_FEEDS = os.getenv("NEWS_FEEDS", ",".join(DEFAULT_NEWS_FEEDS)).split(",")
-NEWS_FEEDS = [f.strip() for f in NEWS_FEEDS if f.strip()]
 
-# Relevance scoring thresholds
-MIN_RELEVANCE_SCORE = int(os.getenv("MIN_RELEVANCE_SCORE", "4"))
+# Parse NEWS_FEEDS from env var or use defaults
+# Format: "url1,age1,rel1;url2,age2,rel2" or just "url1,url2" (uses defaults)
+try:
+    feeds_env = os.getenv("NEWS_FEEDS", "")
+    if feeds_env:
+        NEWS_FEEDS = []
+        for feed_str in feeds_env.split(";"):
+            parts = [p.strip() for p in feed_str.split(",")]
+            if len(parts) == 3:
+                NEWS_FEEDS.append({"url": parts[0], "max_age_hours": int(parts[1]), "min_relevance": int(parts[2])})
+            elif len(parts) == 1 and parts[0]:
+                # Legacy format: just URL, use global defaults
+                NEWS_FEEDS.append({"url": parts[0], "max_age_hours": 72, "min_relevance": 3})
+    else:
+        NEWS_FEEDS = DEFAULT_NEWS_FEEDS
+except Exception as e:
+    print(f"[bot] WARNING: Failed to parse NEWS_FEEDS env var: {e}")
+    NEWS_FEEDS = DEFAULT_NEWS_FEEDS
 
-# News debugging and age filtering
-NEWS_DEBUG = int(os.getenv("NEWS_DEBUG", "0"))
-MAX_HEADLINE_AGE_HOURS = int(os.getenv("MAX_HEADLINE_AGE_HOURS", "24"))
+# Global fallback thresholds (used when feed config doesn't specify)
+MIN_RELEVANCE_SCORE = int(os.getenv("MIN_RELEVANCE_SCORE", "3"))
+MAX_HEADLINE_AGE_HOURS = int(os.getenv("MAX_HEADLINE_AGE_HOURS", "72"))
+
+# Enhanced debugging mode: DEBUG_NEWS=1 logs per-item details
+# (title, url, timestamp, age, score, matched_terms, discard_reason)
+DEBUG_NEWS = int(os.getenv("DEBUG_NEWS", "0"))
+NEWS_DEBUG = DEBUG_NEWS  # Backward compatibility
 
 # Pip sizes and price formatting (dynamic based on instrument)
 PIP_MAP = {"EUR_USD": 0.0001, "GBP_USD": 0.0001, "USD_JPY": 0.01, "XAU_USD": 0.1}
@@ -303,38 +326,61 @@ def mark_headline_seen(headline_id: str, seen: set) -> set:
 
 
 # ========= FX Relevance Scoring =========
-def calculate_fx_relevance_score(title: str) -> int:
+def calculate_fx_relevance_score(title: str, return_matched: bool = False) -> int | tuple[int, list[str]]:
     """Calculate FX relevance score for a headline.
     Higher score = more relevant to FX/macro trading.
+    
+    Args:
+        title: Headline text to score
+        return_matched: If True, return (score, matched_terms) tuple
+    
+    Returns:
+        int: relevance score, or tuple[int, list[str]] if return_matched=True
     """
     title_upper = title.upper()
     score = 0
+    matched_terms = []
     
     # Central banks (+3)
     central_banks = ["ECB", "FED", "FEDERAL RESERVE", "BOE", "BOJ", "SNB", "RBA", "RBNZ", "PBOC"]
-    if any(cb in title_upper for cb in central_banks):
-        score += 3
+    for cb in central_banks:
+        if cb in title_upper:
+            score += 3
+            matched_terms.append(f"+3:{cb}")
+            break
     
     # Key economic indicators and monetary policy (+3)
     monetary_terms = ["CPI", "INFLATION", "RATE", "HIKE", "CUT", "YIELD", "BOND", "TREASURY", "MONETARY"]
-    if any(term in title_upper for term in monetary_terms):
-        score += 3
+    for term in monetary_terms:
+        if term in title_upper:
+            score += 3
+            matched_terms.append(f"+3:{term}")
+            break
     
     # Economic data (+2)
     economic_data = ["GDP", "PMI", "NFP", "JOB", "UNEMPLOYMENT", "RETAIL SALES", "PAYROLL", "MANUFACTURING"]
-    if any(term in title_upper for term in economic_data):
-        score += 2
+    for term in economic_data:
+        if term in title_upper:
+            score += 2
+            matched_terms.append(f"+2:{term}")
+            break
     
     # High-impact data releases (+1 bonus)
     high_impact = ["NFP", "NON-FARM", "PAYROLL", "FOMC", "CPI", "INFLATION"]
-    if any(term in title_upper for term in high_impact):
-        score += 1
+    for term in high_impact:
+        if term in title_upper:
+            score += 1
+            matched_terms.append(f"+1:{term}")
+            break
     
     # Currency mentions (+2)
     currencies = ["EUR", "USD", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "DOLLAR", "EURO", "POUND", "YEN"]
     currency_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD", "USD/CAD"]
-    if any(curr in title_upper for curr in currencies + currency_pairs):
-        score += 2
+    for curr in currencies + currency_pairs:
+        if curr in title_upper:
+            score += 2
+            matched_terms.append(f"+2:{curr}")
+            break
     
     # Negative filters (-5 each)
     non_market_terms = [
@@ -345,6 +391,7 @@ def calculate_fx_relevance_score(title: str) -> int:
     for term in non_market_terms:
         if term in title_upper:
             score -= 5
+            matched_terms.append(f"-5:{term}")
     
     return score
 
@@ -380,14 +427,14 @@ def detect_instrument_from_headline(title: str, default: str = "EUR_USD") -> str
 
 # ========= News & sentiment =========
 def fetch_headlines(limit=15) -> list[dict]:
-    """Fetch headlines from multiple RSS feeds with fallback.
-    Returns list of dicts with keys: title, source, guid, link, score, instrument, published_utc
-    Includes DEBUG logging and age filtering.
+    """Fetch headlines from multiple RSS feeds with source-aware filtering.
+    Returns list of dicts with keys: title, source, guid, link, score, instrument, published_utc, age_hours
     
-    STRICT REQUIREMENTS:
-    - Every item MUST have a parseable publish timestamp
-    - Items without timestamps are DISCARDED
-    - Items older than MAX_HEADLINE_AGE_HOURS are DISCARDED
+    Features:
+    - Per-feed max_age_hours and min_relevance thresholds
+    - Enhanced timestamp parsing with multiple fallbacks (published, updated, pubDate, dc:date)
+    - Final fallback to feed buildDate if item timestamp missing/unreliable
+    - DEBUG_NEWS mode logs per-item details: title, url, timestamp, age, score, matched_terms, discard_reason
     """
     all_entries = []
     seen_canonical_urls = set()  # For cross-source deduplication
@@ -401,37 +448,65 @@ def fetch_headlines(limit=15) -> list[dict]:
         'too_old': 0,
         'low_relevance': 0,
         'duplicate_url': 0,
-        'accepted': 0
+        'accepted': 0,
+        'feed_builddate_fallback': 0
     }
     
-    if NEWS_DEBUG:
-        print(f"[bot][DEBUG] NEWS_DEBUG={NEWS_DEBUG}, MAX_HEADLINE_AGE_HOURS={MAX_HEADLINE_AGE_HOURS}")
+    # Track top 10 discarded items for debug logging
+    discarded_items = []
     
-    for rss_url in NEWS_FEEDS:
+    if DEBUG_NEWS:
+        print(f"[bot][DEBUG_NEWS] Enhanced debugging enabled")
+        print(f"[bot][DEBUG_NEWS] Global fallbacks: MAX_AGE={MAX_HEADLINE_AGE_HOURS}h, MIN_RELEVANCE={MIN_RELEVANCE_SCORE}")
+        print(f"[bot][DEBUG_NEWS] Processing {len(NEWS_FEEDS)} feeds with per-source configuration")
+    
+    for feed_config in NEWS_FEEDS:
+        # Extract feed configuration (support both dict and legacy string format)
+        if isinstance(feed_config, dict):
+            rss_url = feed_config['url']
+            feed_max_age = feed_config.get('max_age_hours', MAX_HEADLINE_AGE_HOURS)
+            feed_min_relevance = feed_config.get('min_relevance', MIN_RELEVANCE_SCORE)
+        else:
+            # Legacy string format
+            rss_url = feed_config
+            feed_max_age = MAX_HEADLINE_AGE_HOURS
+            feed_min_relevance = MIN_RELEVANCE_SCORE
         try:
             # Fetch the feed with explicit request to capture status
-            if NEWS_DEBUG:
-                print(f"[bot][DEBUG] Fetching: {rss_url}")
+            if DEBUG_NEWS:
+                print(f"[bot][DEBUG_NEWS] ===== Fetching: {rss_url} =====")
+                print(f"[bot][DEBUG_NEWS]   Feed config: max_age={feed_max_age}h, min_relevance={feed_min_relevance}")
             
             response = requests.get(rss_url, timeout=10)
             status_code = response.status_code
             content_length = len(response.content)
             
-            if NEWS_DEBUG:
-                print(f"[bot][DEBUG]   HTTP Status: {status_code}")
-                print(f"[bot][DEBUG]   Response Size: {content_length} bytes")
+            if DEBUG_NEWS:
+                print(f"[bot][DEBUG_NEWS]   HTTP Status: {status_code}, Size: {content_length} bytes")
             
             # Parse with feedparser
             feed = feedparser.parse(response.content)
             source = rss_url.split('/')[2]  # Extract domain
             
+            # Extract feed-level buildDate as fallback timestamp
+            feed_build_date = None
+            try:
+                if hasattr(feed.feed, 'updated_parsed') and feed.feed.updated_parsed:
+                    feed_build_date = datetime(*feed.feed.updated_parsed[:6], tzinfo=timezone.utc)
+                elif hasattr(feed.feed, 'published_parsed') and feed.feed.published_parsed:
+                    feed_build_date = datetime(*feed.feed.published_parsed[:6], tzinfo=timezone.utc)
+                if DEBUG_NEWS and feed_build_date:
+                    print(f"[bot][DEBUG_NEWS]   Feed buildDate: {feed_build_date.strftime('%Y-%m-%d %H:%M UTC')} (fallback for items without timestamps)")
+            except Exception as e:
+                if DEBUG_NEWS:
+                    print(f"[bot][DEBUG_NEWS]   No feed buildDate available: {e}")
+            
             parsed_count = len(feed.entries[:limit])
-            if NEWS_DEBUG:
-                print(f"[bot][DEBUG]   Parsed Headlines: {parsed_count}")
+            if DEBUG_NEWS:
+                print(f"[bot][DEBUG_NEWS]   Parsed {parsed_count} entries from feed")
             
             # Track items for this source
             source_relevant = 0
-            source_items = []
             
             for e in feed.entries[:limit]:
                 title = e.get("title", "").strip()
@@ -443,76 +518,116 @@ def fetch_headlines(limit=15) -> list[dict]:
                 link = e.get("link", "")
                 guid = e.get("id", link)
                 
-                # Parse published time
+                # Enhanced timestamp parsing with comprehensive fallback chain
                 published_utc = None
-                pub_date_str = None
+                timestamp_source = None
                 
-                # Try multiple date fields
-                for date_field in ['published', 'pubDate', 'updated', 'created']:
-                    if date_field in e:
-                        pub_date_str = e[date_field]
-                        break
+                # Try multiple date fields in priority order
+                date_fields = [
+                    ('published_parsed', 'published'),
+                    ('updated_parsed', 'updated'),
+                    ('created_parsed', 'created'),
+                ]
                 
-                # Parse the date
-                if pub_date_str:
-                    try:
-                        # feedparser often provides published_parsed
-                        if hasattr(e, 'published_parsed') and e.published_parsed:
-                            published_utc = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-                        elif hasattr(e, 'updated_parsed') and e.updated_parsed:
-                            published_utc = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
-                        else:
-                            # Try parsing with email.utils for RFC 2822 format
-                            parsed_time = email.utils.parsedate_to_datetime(pub_date_str)
-                            if parsed_time:
-                                # Convert to UTC if it has timezone info
-                                if parsed_time.tzinfo is None:
-                                    published_utc = parsed_time.replace(tzinfo=timezone.utc)
-                                else:
-                                    published_utc = parsed_time.astimezone(timezone.utc)
-                    except Exception as parse_err:
-                        discard_stats['parse_failed'] += 1
-                        if NEWS_DEBUG:
-                            print(f"[bot][DEBUG]   DISCARDED (parse failed): {title[:50]}... | error: {parse_err}")
-                        continue
+                # Attempt to parse from feedparser's pre-parsed time tuples
+                for parsed_field, str_field in date_fields:
+                    if hasattr(e, parsed_field) and getattr(e, parsed_field):
+                        try:
+                            published_utc = datetime(*getattr(e, parsed_field)[:6], tzinfo=timezone.utc)
+                            timestamp_source = parsed_field
+                            break
+                        except Exception:
+                            pass
                 
-                # STRICT: Discard if no published time
+                # If pre-parsed fields failed, try string date fields
+                if not published_utc:
+                    for date_field in ['published', 'pubDate', 'updated', 'created', 'dc:date']:
+                        pub_date_str = e.get(date_field)
+                        if pub_date_str:
+                            try:
+                                parsed_time = email.utils.parsedate_to_datetime(pub_date_str)
+                                if parsed_time:
+                                    if parsed_time.tzinfo is None:
+                                        published_utc = parsed_time.replace(tzinfo=timezone.utc)
+                                    else:
+                                        published_utc = parsed_time.astimezone(timezone.utc)
+                                    timestamp_source = date_field
+                                    break
+                            except Exception:
+                                pass
+                
+                # Final fallback: use feed buildDate if available
+                if not published_utc and feed_build_date:
+                    published_utc = feed_build_date
+                    timestamp_source = 'feed_buildDate'
+                    discard_stats['feed_builddate_fallback'] += 1
+                
+                # Discard if still no timestamp after all fallbacks
                 if not published_utc:
                     discard_stats['no_timestamp'] += 1
-                    if NEWS_DEBUG:
-                        print(f"[bot][DEBUG]   DISCARDED (no timestamp): {title[:50]}...")
-                    continue
-                
-                # Check age - STRICT age gate
-                age_hours = (now - published_utc).total_seconds() / 3600
-                if age_hours > MAX_HEADLINE_AGE_HOURS:
-                    discard_stats['too_old'] += 1
-                    if NEWS_DEBUG:
-                        print(f"[bot][DEBUG]   DISCARDED (age={age_hours:.1f}h > {MAX_HEADLINE_AGE_HOURS}h): {title[:50]}...")
-                    continue
-                
-                # Store for DEBUG printing (first 10 per source)
-                if NEWS_DEBUG and len(source_items) < 10:
-                    source_items.append({
-                        'published_utc': published_utc,
+                    discarded_items.append({
                         'title': title,
-                        'link': link
+                        'reason': 'no_timestamp',
+                        'age_hours': None,
+                        'relevance_score': None,
+                        'url': link
                     })
+                    if DEBUG_NEWS:
+                        print(f"[bot][DEBUG_NEWS] ✗ DISCARD: no_timestamp | {title[:60]}...")
+                        print(f"[bot][DEBUG_NEWS]          url={link[:80]}")
+                    continue
                 
-                # Calculate relevance score
-                score = calculate_fx_relevance_score(title)
+                # Check age - source-aware age gate
+                age_hours = (now - published_utc).total_seconds() / 3600
+                if age_hours > feed_max_age:
+                    discard_stats['too_old'] += 1
+                    discarded_items.append({
+                        'title': title,
+                        'reason': f'too_old (age={age_hours:.1f}h > {feed_max_age}h)',
+                        'age_hours': age_hours,
+                        'relevance_score': None,
+                        'url': link
+                    })
+                    if DEBUG_NEWS:
+                        print(f"[bot][DEBUG_NEWS] ✗ DISCARD: too_old | age={age_hours:.1f}h > {feed_max_age}h | {title[:60]}...")
+                        print(f"[bot][DEBUG_NEWS]          timestamp={published_utc.strftime('%Y-%m-%d %H:%M UTC')} (from:{timestamp_source})")
+                    continue
                 
-                # Skip if below minimum threshold
-                if score < MIN_RELEVANCE_SCORE:
+                # Calculate relevance score with matched terms for debug logging
+                if DEBUG_NEWS:
+                    score, matched_terms = calculate_fx_relevance_score(title, return_matched=True)
+                else:
+                    score = calculate_fx_relevance_score(title, return_matched=False)
+                    matched_terms = []
+                
+                # Skip if below feed-specific minimum threshold
+                if score < feed_min_relevance:
                     discard_stats['low_relevance'] += 1
+                    discarded_items.append({
+                        'title': title,
+                        'reason': f'low_relevance (score={score} < {feed_min_relevance})',
+                        'age_hours': age_hours,
+                        'relevance_score': score,
+                        'url': link
+                    })
+                    if DEBUG_NEWS:
+                        matched_str = ",".join(matched_terms) if matched_terms else "none"
+                        print(f"[bot][DEBUG_NEWS] ✗ DISCARD: low_relevance | score={score} < {feed_min_relevance} | matched=[{matched_str}] | {title[:50]}...")
                     continue
                 
                 # Deduplicate by canonical URL
                 canonical_url = canonicalize_url(link)
                 if canonical_url in seen_canonical_urls:
                     discard_stats['duplicate_url'] += 1
-                    if NEWS_DEBUG:
-                        print(f"[bot][DEBUG]   DISCARDED (duplicate URL): {title[:50]}...")
+                    discarded_items.append({
+                        'title': title,
+                        'reason': 'duplicate_url',
+                        'age_hours': age_hours,
+                        'relevance_score': score,
+                        'url': link
+                    })
+                    if DEBUG_NEWS:
+                        print(f"[bot][DEBUG_NEWS] ✗ DISCARD: duplicate_url | {title[:60]}...")
                     continue
                 seen_canonical_urls.add(canonical_url)
                 
@@ -521,6 +636,15 @@ def fetch_headlines(limit=15) -> list[dict]:
                 
                 # ACCEPTED - this item passed all gates
                 discard_stats['accepted'] += 1
+                
+                # DEBUG_NEWS: Log detailed acceptance info
+                if DEBUG_NEWS:
+                    matched_str = ",".join(matched_terms) if matched_terms else "none"
+                    print(f"[bot][DEBUG_NEWS] ✓ ACCEPT: score={score} (>={feed_min_relevance}) | age={age_hours:.1f}h (<{feed_max_age}h) | {instrument}")
+                    print(f"[bot][DEBUG_NEWS]          timestamp={published_utc.strftime('%Y-%m-%d %H:%M UTC')} (from:{timestamp_source})")
+                    print(f"[bot][DEBUG_NEWS]          matched=[{matched_str}]")
+                    print(f"[bot][DEBUG_NEWS]          title: {title[:80]}...")
+                    print(f"[bot][DEBUG_NEWS]          url: {link[:100]}")
                 
                 all_entries.append({
                     "title": title,
@@ -534,14 +658,7 @@ def fetch_headlines(limit=15) -> list[dict]:
                 })
                 source_relevant += 1
             
-            # DEBUG: Print first 10 parsed items
-            if NEWS_DEBUG and source_items:
-                print(f"[bot][DEBUG] First {len(source_items)} parsed items from {source}:")
-                for item in source_items:
-                    timestamp = item['published_utc'].strftime('%Y-%m-%d %H:%M:%S UTC')
-                    print(f"[bot][DEBUG]   {timestamp} | {item['title'][:60]}... | {item['link'][:80]}")
-            
-            print(f"[bot] fetched {source_relevant} relevant headlines from {source} (status={status_code}, size={content_length}B, parsed={parsed_count})")
+            print(f"[bot] fetched {source_relevant} relevant headlines from {source} (status={status_code}, size={content_length}B, parsed={parsed_count}, max_age={feed_max_age}h, min_rel={feed_min_relevance})")
         
         except Exception as e:
             print(f"[bot] feed error {rss_url.split('/')[2] if '/' in rss_url else rss_url}: {e}")
@@ -557,21 +674,26 @@ def fetch_headlines(limit=15) -> list[dict]:
         print(f"[bot] WARNING: All {discard_stats['total_parsed']} items discarded - breakdown:")
         print(f"[bot]   - no_timestamp: {discard_stats['no_timestamp']}")
         print(f"[bot]   - parse_failed: {discard_stats['parse_failed']}")
-        print(f"[bot]   - too_old (>{MAX_HEADLINE_AGE_HOURS}h): {discard_stats['too_old']}")
-        print(f"[bot]   - low_relevance (<{MIN_RELEVANCE_SCORE}): {discard_stats['low_relevance']}")
+        print(f"[bot]   - too_old: {discard_stats['too_old']} (thresholds vary by feed)")
+        print(f"[bot]   - low_relevance: {discard_stats['low_relevance']} (thresholds vary by feed)")
         print(f"[bot]   - duplicate_url: {discard_stats['duplicate_url']}")
+    
+    if discard_stats['feed_builddate_fallback'] > 0:
+        print(f"[bot] INFO: {discard_stats['feed_builddate_fallback']} items used feed buildDate as timestamp fallback")
+    
+    # Debug logging: Print top 10 discarded items
+    if discarded_items and not DEBUG_NEWS:  # Skip if DEBUG_NEWS already logged everything
+        print(f"[bot] Top {min(10, len(discarded_items))} discarded items:")
+        for i, item in enumerate(discarded_items[:10], 1):
+            age_str = f"age={item['age_hours']:.1f}h" if item['age_hours'] is not None else "age=N/A"
+            score_str = f"score={item['relevance_score']}" if item['relevance_score'] is not None else "score=N/A"
+            print(f"[bot]   {i}. [{age_str}, {score_str}] {item['reason']}: {item['title'][:70]}...")
+            if 'url' in item and item['url']:
+                print(f"[bot]       url: {item['url'][:90]}")
     elif len(all_entries) > 0:
         # Show age range of accepted candidates
         ages = [e['age_hours'] for e in all_entries]
-        print(f"[bot] age range: {min(ages):.1f}h - {max(ages):.1f}h (max allowed: {MAX_HEADLINE_AGE_HOURS}h)")
-        
-        # Log first few candidates with their details
-        if NEWS_DEBUG:
-            print(f"[bot][DEBUG] Top {min(5, len(all_entries))} candidates:")
-            for i, e in enumerate(all_entries[:5], 1):
-                pub_str = e['published_utc'].strftime('%Y-%m-%d %H:%M UTC')
-                print(f"[bot][DEBUG]   {i}. age={e['age_hours']:.1f}h, pub={pub_str}, score={e['score']}")
-                print(f"[bot][DEBUG]      {e['title'][:80]}...")
+        print(f"[bot] age range: {min(ages):.1f}h - {max(ages):.1f}h (thresholds vary by feed)")
     
     return all_entries
 
@@ -677,8 +799,14 @@ def record_last_trade_headline(headline: str, sentiment: float, side: str, sourc
 def main():
     print(f"[bot] starting… DRY_RUN={'ENABLED (no orders will be placed)' if DRY_RUN else 'DISABLED (live trading)'}")
     print(f"[bot] config: default_instrument={DEFAULT_INSTRUMENT} tp={TP_PIPS} sl={SL_PIPS} threshold={SENT_THRESHOLD}")
-    print(f"[bot] safety: headline_dedupe={SEEN_HEADLINES_PATH}, min_relevance_score={MIN_RELEVANCE_SCORE}")
-    print(f"[bot] feeds: {len(NEWS_FEEDS)} RSS sources configured")
+    print(f"[bot] safety: headline_dedupe={SEEN_HEADLINES_PATH}")
+    print(f"[bot] DEBUG_NEWS mode: {'ENABLED (per-item logging)' if DEBUG_NEWS else 'DISABLED'}")
+    print(f"[bot] feeds: {len(NEWS_FEEDS)} RSS sources configured (source-aware filtering):")
+    for i, feed in enumerate(NEWS_FEEDS, 1):
+        if isinstance(feed, dict):
+            print(f"[bot]   {i}. {feed['url'].split('/')[2]}: max_age={feed.get('max_age_hours', MAX_HEADLINE_AGE_HOURS)}h, min_rel={feed.get('min_relevance', MIN_RELEVANCE_SCORE)}")
+        else:
+            print(f"[bot]   {i}. {feed.split('/')[2] if '/' in feed else feed}: max_age={MAX_HEADLINE_AGE_HOURS}h, min_rel={MIN_RELEVANCE_SCORE}")
     last_trade_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
     
     # Load seen headlines at startup
