@@ -393,6 +393,8 @@ def calculate_fx_relevance_score(title: str, return_matched: bool = False) -> in
             score -= 5
             matched_terms.append(f"-5:{term}")
     
+    if return_matched:
+        return score, matched_terms
     return score
 
 
